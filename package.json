@@ -1,0 +1,23 @@
+{
+  "name": "webex-mcp",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Local stdio MCP server for Webex, optimized for Bun runtime and package management.",
+  "scripts": {
+    "auth:status": "bun oauth.mjs status --env-file .env.local",
+    "auth:login": "bun oauth.mjs login --env-file .env.local",
+    "auth:refresh": "bun oauth.mjs refresh --env-file .env.local",
+    "auth:clear": "bun oauth.mjs clear --env-file .env.local",
+    "start": "bun server.mjs",
+    "start:env": "bun server.mjs --env-file .env.local",
+    "check": "bun --smol server.mjs </dev/null"
+  },
+  "packageManager": "bun@1.3.11",
+  "dependencies": {
+    "@webex/internal-plugin-conversation": "^3.12.0",
+    "@webex/internal-plugin-mercury": "^3.12.0",
+    "@webex/internal-plugin-metrics": "^3.12.0",
+    "webex-node": "^3.12.0"
+  }
+}

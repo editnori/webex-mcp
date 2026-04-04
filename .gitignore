@@ -1,0 +1,6 @@
+.data/
+.env*
+!.env.example
+.webex_tokens.json
+node_modules/
+*.log
