@@ -3,4 +3,6 @@
 !.env.example
 .webex_tokens.json
 node_modules/
+__pycache__/
+*.pyc
 *.log
