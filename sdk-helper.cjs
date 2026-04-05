@@ -1,11 +1,6 @@
 #!/usr/bin/env node
 
-const TOKEN = process.env.WEBEX_HELPER_ACCESS_TOKEN || '';
-
-if (!TOKEN) {
-  console.log(JSON.stringify({ok: false, error: 'WEBEX_HELPER_ACCESS_TOKEN is required'}));
-  process.exit(1);
-}
+const readline = require('node:readline');
 
 require('@webex/internal-plugin-metrics');
 require('@webex/internal-plugin-mercury');
@@ -14,9 +9,17 @@ require('@webex/internal-plugin-conversation');
 const WebexNode = require('webex-node');
 const {
   deconstructHydraId,
-  buildHydraRoomId,
   buildHydraMessageId,
 } = require('@webex/common');
+
+let webex = null;
+let conversationRuntimeReady = false;
+let initialized = false;
+let queue = Promise.resolve();
+
+function send(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
 
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
@@ -27,8 +30,8 @@ function withTimeout(promise, timeoutMs, label) {
   ]);
 }
 
-function patchMetrics(webex) {
-  const metrics = webex.internal?.newMetrics;
+function patchMetrics(instance) {
+  const metrics = instance.internal?.newMetrics;
   if (!metrics) return;
 
   const callDiagnosticMetrics = metrics.callDiagnosticMetrics || {};
@@ -112,24 +115,8 @@ function summarizeInternalActivity(activity, cluster = 'us') {
   };
 }
 
-function summarizeThread(thread, fallbackCluster = 'us') {
-  const cluster = thread.cluster || fallbackCluster;
-  return {
-    id: thread.id || null,
-    conversationId: thread.conversationId || null,
-    roomId: thread.conversationId ? buildHydraRoomId(thread.conversationId, cluster) : null,
-    parentActivityId: thread.parentActivityId || null,
-    parentMessageId: thread.parentActivityId ? buildHydraMessageId(thread.parentActivityId, cluster) : null,
-    childType: thread.childType || '',
-    childCount: Array.isArray(thread.childActivities) ? thread.childActivities.length : 0,
-    childActivities: Array.isArray(thread.childActivities)
-      ? thread.childActivities.map((item) => summarizeInternalActivity(item, cluster))
-      : [],
-  };
-}
-
-function ensureConversationServiceCatalog(webex, command) {
-  const service = webex.internal?.services?.get('conversation', true);
+function ensureConversationServiceCatalog(command) {
+  const service = webex?.internal?.services?.get('conversation', true);
   if (!service) {
     throw new Error(
       `Internal conversation service unavailable for ${command}. The SDK in this environment does not have the conversation service catalog loaded.`
@@ -139,18 +126,24 @@ function ensureConversationServiceCatalog(webex, command) {
   return service;
 }
 
-async function bootstrapConversationRuntime(webex, command, timeoutMs) {
+async function bootstrapConversationRuntime(command, timeoutMs) {
+  if (conversationRuntimeReady) {
+    ensureConversationServiceCatalog(command);
+    return;
+  }
+
   await withTimeout(
     webex.internal.services.waitForCatalog('postauth'),
     timeoutMs,
     'services.waitForCatalog(postauth)'
   );
-  ensureConversationServiceCatalog(webex, command);
+  ensureConversationServiceCatalog(command);
   await withTimeout(webex.internal.mercury.connect(), timeoutMs, 'mercury.connect()');
-  ensureConversationServiceCatalog(webex, command);
+  ensureConversationServiceCatalog(command);
+  conversationRuntimeReady = true;
 }
 
-async function resolveReactionParentActivity(webex, conversation, messageId, timeoutMs, activitiesLimit = 200) {
+async function resolveReactionParentActivity(conversation, messageId, timeoutMs, activitiesLimit = 200) {
   const normalizedMessageId = normalizeActivityId(messageId);
   const convo = await withTimeout(
     webex.internal.conversation.get(conversation, {
@@ -186,157 +179,169 @@ async function resolveReactionParentActivity(webex, conversation, messageId, tim
   throw new Error(`Could not resolve encryption metadata for message ${messageId}.`);
 }
 
-async function main() {
-  const command = process.argv[2] || '';
-  const payload = process.argv[3] ? JSON.parse(process.argv[3]) : {};
-  const timeoutMs = Number(payload.timeoutMs || 30000);
-  const webex = WebexNode.init({credentials: {access_token: TOKEN}});
+function initialize(token) {
+  webex = WebexNode.init({credentials: {access_token: token}});
   patchMetrics(webex);
-
-  try {
-    if (command === 'list_rooms_with_read_status') {
-      const result = await withTimeout(
-        webex.rooms.listWithReadStatus(Number(payload.maxRecent || 0)),
-        timeoutMs,
-        'rooms.listWithReadStatus()'
-      );
-      const items = result.items || result;
-      console.log(JSON.stringify({ok: true, result: {count: items.length, rooms: items.map(summarizeReadRoom)}}));
-      return;
-    }
-
-    if (command === 'get_room_with_read_status') {
-      const result = await withTimeout(
-        webex.rooms.getWithReadStatus(payload.roomId),
-        timeoutMs,
-        'rooms.getWithReadStatus()'
-      );
-      console.log(JSON.stringify({ok: true, result: summarizeReadRoom(result)}));
-      return;
-    }
-
-    if (command === 'mark_message_seen') {
-      const result = await withTimeout(
-        webex.memberships.updateLastSeen({id: payload.messageId, roomId: payload.roomId}),
-        timeoutMs,
-        'memberships.updateLastSeen()'
-      );
-      console.log(JSON.stringify({ok: true, result: summarizeSeenUpdate(result)}));
-      return;
-    }
-
-    if (command === 'update_typing_status') {
-      await bootstrapConversationRuntime(webex, command, timeoutMs);
-      const conversation = toInternalConversationRef(payload.roomId);
-      await withTimeout(
-        webex.internal.conversation.updateTypingStatus(conversation, {
-          typing: Boolean(payload.typing),
-        }),
-        timeoutMs,
-        'conversation.updateTypingStatus()'
-      );
-      console.log(JSON.stringify({ok: true, result: {roomId: payload.roomId, typing: Boolean(payload.typing)}}));
-      return;
-    }
-
-    if (command === 'list_threads') {
-      await bootstrapConversationRuntime(webex, command, timeoutMs);
-      const allThreads = await withTimeout(
-        webex.internal.conversation.listThreads(),
-        timeoutMs,
-        'conversation.listThreads()'
-      );
-      const room = payload.roomId ? toInternalConversationRef(payload.roomId) : null;
-      const filtered = room
-        ? allThreads.filter((item) => item.conversationId === room.id)
-        : allThreads;
-      const limited = filtered.slice(0, Number(payload.maxResults || 20));
-      console.log(
-        JSON.stringify({
-          ok: true,
-          result: {
-            count: limited.length,
-            threads: limited.map((item) => summarizeThread(item, room?.cluster || 'us')),
-          },
-        })
-      );
-      return;
-    }
-
-    if (command === 'add_reaction') {
-      await bootstrapConversationRuntime(webex, command, timeoutMs);
-      const conversation = toInternalConversationRef(payload.roomId);
-      const cluster = conversation.cluster;
-      const parentActivity = await resolveReactionParentActivity(
-        webex,
-        conversation,
-        payload.messageId,
-        timeoutMs,
-        Number(payload.activitiesLimit || 200)
-      );
-      const result = await withTimeout(
-        webex.internal.conversation.addReaction(
-          conversation,
-          payload.reaction,
-          parentActivity
-        ),
-        timeoutMs,
-        'conversation.addReaction()'
-      );
-      console.log(JSON.stringify({ok: true, result: summarizeInternalActivity(result, cluster)}));
-      return;
-    }
-
-    if (command === 'delete_reaction') {
-      await bootstrapConversationRuntime(webex, command, timeoutMs);
-      const conversation = toInternalConversationRef(payload.roomId);
-      const cluster = conversation.cluster;
-      const result = await withTimeout(
-        webex.internal.conversation.deleteReaction(
-          conversation,
-          normalizeActivityId(payload.reactionId)
-        ),
-        timeoutMs,
-        'conversation.deleteReaction()'
-      );
-      console.log(JSON.stringify({ok: true, result: summarizeInternalActivity(result, cluster)}));
-      return;
-    }
-
-    if (command === 'set_conversation_state') {
-      await bootstrapConversationRuntime(webex, command, timeoutMs);
-      const conversation = toInternalConversationRef(payload.roomId);
-      const cluster = conversation.cluster;
-      const action = `${payload.action || ''}`;
-      const allowed = new Set(['favorite', 'unfavorite', 'hide', 'unhide', 'mute', 'unmute']);
-      if (!allowed.has(action)) {
-        throw new Error(`Unsupported conversation state action: ${action}`);
-      }
-      const result = await withTimeout(
-        webex.internal.conversation[action](conversation),
-        timeoutMs,
-        `conversation.${action}()`
-      );
-      console.log(JSON.stringify({ok: true, result: summarizeInternalActivity(result, cluster)}));
-      return;
-    }
-
-    console.log(JSON.stringify({ok: false, error: `Unknown SDK helper command: ${command}`}));
-    process.exitCode = 1;
-    return;
-  } catch (error) {
-    console.log(
-      JSON.stringify({
-        ok: false,
-        error: error?.message || String(error),
-        detail: error?.stack || '',
-      })
-    );
-    process.exitCode = 1;
-    return;
-  } finally {
-    process.exit(process.exitCode || 0);
-  }
+  initialized = true;
+  conversationRuntimeReady = false;
 }
 
-main();
+async function executeCommand(command, payload = {}) {
+  if (!initialized || !webex) {
+    throw new Error('SDK helper is not initialized.');
+  }
+
+  const timeoutMs = Number(payload.timeoutMs || 30000);
+
+  if (command === 'list_rooms_with_read_status') {
+    const result = await withTimeout(
+      webex.rooms.listWithReadStatus(Number(payload.maxRecent || 0)),
+      timeoutMs,
+      'rooms.listWithReadStatus()'
+    );
+    const items = result.items || result;
+    return {count: items.length, rooms: items.map(summarizeReadRoom)};
+  }
+
+  if (command === 'get_room_with_read_status') {
+    const result = await withTimeout(
+      webex.rooms.getWithReadStatus(payload.roomId),
+      timeoutMs,
+      'rooms.getWithReadStatus()'
+    );
+    return summarizeReadRoom(result);
+  }
+
+  if (command === 'mark_message_seen') {
+    const result = await withTimeout(
+      webex.memberships.updateLastSeen({id: payload.messageId, roomId: payload.roomId}),
+      timeoutMs,
+      'memberships.updateLastSeen()'
+    );
+    return summarizeSeenUpdate(result);
+  }
+
+  if (command === 'update_typing_status') {
+    await bootstrapConversationRuntime(command, timeoutMs);
+    const conversation = toInternalConversationRef(payload.roomId);
+    await withTimeout(
+      webex.internal.conversation.updateTypingStatus(conversation, {
+        typing: Boolean(payload.typing),
+      }),
+      timeoutMs,
+      'conversation.updateTypingStatus()'
+    );
+    return {roomId: payload.roomId, typing: Boolean(payload.typing)};
+  }
+
+  if (command === 'add_reaction') {
+    await bootstrapConversationRuntime(command, timeoutMs);
+    const conversation = toInternalConversationRef(payload.roomId);
+    const cluster = conversation.cluster;
+    const parentActivity = await resolveReactionParentActivity(
+      conversation,
+      payload.messageId,
+      timeoutMs,
+      Number(payload.activitiesLimit || 200)
+    );
+    const result = await withTimeout(
+      webex.internal.conversation.addReaction(
+        conversation,
+        payload.reaction,
+        parentActivity
+      ),
+      timeoutMs,
+      'conversation.addReaction()'
+    );
+    return summarizeInternalActivity(result, cluster);
+  }
+
+  if (command === 'delete_reaction') {
+    await bootstrapConversationRuntime(command, timeoutMs);
+    const conversation = toInternalConversationRef(payload.roomId);
+    const cluster = conversation.cluster;
+    const result = await withTimeout(
+      webex.internal.conversation.deleteReaction(
+        conversation,
+        normalizeActivityId(payload.reactionId)
+      ),
+      timeoutMs,
+      'conversation.deleteReaction()'
+    );
+    return summarizeInternalActivity(result, cluster);
+  }
+
+  if (command === 'set_conversation_state') {
+    await bootstrapConversationRuntime(command, timeoutMs);
+    const conversation = toInternalConversationRef(payload.roomId);
+    const cluster = conversation.cluster;
+    const action = `${payload.action || ''}`;
+    const allowed = new Set(['favorite', 'unfavorite', 'hide', 'unhide', 'mute', 'unmute']);
+    if (!allowed.has(action)) {
+      throw new Error(`Unsupported conversation state action: ${action}`);
+    }
+    const result = await withTimeout(
+      webex.internal.conversation[action](conversation),
+      timeoutMs,
+      `conversation.${action}()`
+    );
+    return summarizeInternalActivity(result, cluster);
+  }
+
+  throw new Error(`Unknown SDK helper command: ${command}`);
+}
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity,
+});
+
+rl.on('line', (line) => {
+  queue = queue
+    .then(async () => {
+      if (!line.trim()) return;
+
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        send({type: 'response', id: null, ok: false, error: `Invalid helper input: ${error.message || String(error)}`});
+        return;
+      }
+
+      if (message.type === 'init') {
+        if (!message.token) {
+          send({type: 'response', id: null, ok: false, error: 'Helper token is required'});
+          return;
+        }
+        initialize(message.token);
+        send({type: 'ready'});
+        return;
+      }
+
+      if (message.type !== 'call') {
+        send({type: 'response', id: message.id || null, ok: false, error: `Unknown helper message type: ${message.type || ''}`});
+        return;
+      }
+
+      try {
+        const result = await executeCommand(message.command, message.payload || {});
+        send({type: 'response', id: message.id, ok: true, result});
+      } catch (error) {
+        send({
+          type: 'response',
+          id: message.id,
+          ok: false,
+          error: error?.message || String(error),
+          detail: error?.stack || '',
+        });
+      }
+    })
+    .catch((error) => {
+      send({type: 'response', id: null, ok: false, error: error?.message || String(error), detail: error?.stack || ''});
+    });
+});
+
+rl.on('close', () => {
+  process.exit(process.exitCode || 0);
+});

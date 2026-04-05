@@ -1,16 +1,23 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline';
-import {spawnSync} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
+import {ensurePrivateDir, readJsonFile, writeJsonFile, withLockedFile} from './auth-store.mjs';
 
 const SERVER_NAME = 'webex';
 const SERVER_VERSION = '0.1.0';
 const PROTOCOL_VERSION = '2024-11-05';
-const DEFAULT_DOWNLOAD_DIR = path.join(process.cwd(), '.data', 'downloads');
-const DEFAULT_INDEX_DB = path.join(process.cwd(), '.data', 'index.sqlite');
+const DEFAULT_STATE_DIR = path.join(
+  process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'),
+  'webex-mcp'
+);
+const DEFAULT_DOWNLOAD_DIR = path.join(DEFAULT_STATE_DIR, 'downloads');
+const DEFAULT_INDEX_DB = path.join(DEFAULT_STATE_DIR, 'index.sqlite');
+const DEFAULT_TOKEN_FILE = path.join(DEFAULT_STATE_DIR, 'tokens.json');
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_WRITABLE_GROUP_MEMBERS = 19;
 
@@ -63,10 +70,25 @@ function parseEnvFile(file) {
 
 function loadConfig(envFile) {
   const fileEnv = parseEnvFile(envFile);
-  const env = {
-    ...fileEnv,
-    ...process.env,
-  };
+  const inheritedEnv = {...process.env};
+
+  if (envFile) {
+    for (const key of Object.keys(inheritedEnv)) {
+      if (key.startsWith('WEBEX_')) {
+        delete inheritedEnv[key];
+      }
+    }
+  }
+
+  const env = envFile
+    ? {
+        ...inheritedEnv,
+        ...fileEnv,
+      }
+    : {
+        ...fileEnv,
+        ...inheritedEnv,
+      };
 
   return {
     envFile,
@@ -81,31 +103,13 @@ function resolveMaybeRelative(baseDir, value, fallback = '') {
   return path.join(baseDir, value);
 }
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, {recursive: true});
-}
-
-function readJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(file, data) {
-  ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
 function getTokenFilePath(config) {
-  const configured = config.env.WEBEX_OAUTH_TOKEN_FILE || '.webex_tokens.json';
+  const configured = config.env.WEBEX_OAUTH_TOKEN_FILE || DEFAULT_TOKEN_FILE;
   return resolveMaybeRelative(config.envDir, configured);
 }
 
 function getOauthFile(config) {
-  return readJson(getTokenFilePath(config), null);
+  return readJsonFile(getTokenFilePath(config), null, {strict: true});
 }
 
 async function fetchJson(url, options = {}) {
@@ -155,48 +159,54 @@ async function refreshUserToken(config) {
   const clientSecret = config.env.WEBEX_CLIENT_SECRET;
   const redirectUri = config.env.WEBEX_REDIRECT_URI;
   const tokenFilePath = getTokenFilePath(config);
-  const tokens = getOauthFile(config);
+  return withLockedFile(tokenFilePath, async () => {
+    const tokens = getOauthFile(config);
 
-  if (!clientId || !clientSecret || !redirectUri || !tokens?.refresh_token) {
-    throw new Error('Missing Webex OAuth refresh configuration');
-  }
+    if (!clientId || !clientSecret || !redirectUri || !tokens?.refresh_token) {
+      throw new Error('Missing Webex OAuth refresh configuration');
+    }
 
-  const form = new URLSearchParams();
-  form.set('grant_type', 'refresh_token');
-  form.set('client_id', clientId);
-  form.set('client_secret', clientSecret);
-  form.set('refresh_token', tokens.refresh_token);
-  form.set('redirect_uri', redirectUri);
+    if (Number(tokens.expires_at || 0) > Date.now() + 60_000) {
+      return tokens;
+    }
 
-  const {response, body} = await fetchJson('https://webexapis.com/v1/access_token', {
-    method: 'POST',
-    headers: {'content-type': 'application/x-www-form-urlencoded'},
-    body: form.toString(),
+    const form = new URLSearchParams();
+    form.set('grant_type', 'refresh_token');
+    form.set('client_id', clientId);
+    form.set('client_secret', clientSecret);
+    form.set('refresh_token', tokens.refresh_token);
+    form.set('redirect_uri', redirectUri);
+
+    const {response, body} = await fetchJson('https://webexapis.com/v1/access_token', {
+      method: 'POST',
+      headers: {'content-type': 'application/x-www-form-urlencoded'},
+      body: form.toString(),
+    });
+
+    if (!response.ok) {
+      const error = new Error(`Webex OAuth refresh failed with ${response.status}`);
+      error.status = response.status;
+      error.body = body;
+      throw error;
+    }
+
+    const now = Date.now();
+    const refreshed = {
+      ...tokens,
+      ...body,
+      obtained_at: now,
+      expires_at: now + Number(body.expires_in || 0) * 1000,
+    };
+
+    writeJsonFile(tokenFilePath, refreshed);
+    return refreshed;
   });
-
-  if (!response.ok) {
-    const error = new Error(`Webex OAuth refresh failed with ${response.status}`);
-    error.status = response.status;
-    error.body = body;
-    throw error;
-  }
-
-  const now = Date.now();
-  const refreshed = {
-    ...tokens,
-    ...body,
-    obtained_at: now,
-    expires_at: now + Number(body.expires_in || 0) * 1000,
-  };
-
-  writeJson(tokenFilePath, refreshed);
-  return refreshed;
 }
 
 async function getUserToken(config, {refreshIfNeeded = true} = {}) {
-  if (config.env.WEBEX_READ_TOKEN) return config.env.WEBEX_READ_TOKEN;
+  if (config.env.WEBEX_USER_TOKEN) return config.env.WEBEX_USER_TOKEN;
 
-  const tokens = getOauthFile(config);
+  const tokens = readJsonFile(getTokenFilePath(config), null, {strict: refreshIfNeeded});
   if (!tokens?.access_token) return null;
   if (!refreshIfNeeded) return tokens.access_token;
 
@@ -229,6 +239,49 @@ function absolutePath(baseDir, value) {
   return path.isAbsolute(value) ? value : path.resolve(baseDir, value);
 }
 
+function isTruthyEnv(value) {
+  return /^(1|true|yes|on)$/i.test(`${value || ''}`.trim());
+}
+
+function getAllowedLocalFileRoots(config) {
+  const raw = `${config.env.WEBEX_MCP_LOCAL_FILE_ROOTS || ''}`.trim();
+  if (!raw) return [];
+
+  return raw
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => absolutePath(config.envDir, item));
+}
+
+function resolveAllowedLocalPath(config, inputPath) {
+  if (!isTruthyEnv(config.env.WEBEX_MCP_ENABLE_LOCAL_FILES)) {
+    throw new Error(
+      'Local file access is disabled. Set WEBEX_MCP_ENABLE_LOCAL_FILES=true and WEBEX_MCP_LOCAL_FILE_ROOTS to allow filePaths or extract_local_file_text.'
+    );
+  }
+
+  const allowedRoots = getAllowedLocalFileRoots(config);
+  if (!allowedRoots.length) {
+    throw new Error(
+      'Local file access is enabled but WEBEX_MCP_LOCAL_FILE_ROOTS is empty. Configure one or more allowed roots.'
+    );
+  }
+
+  const resolvedPath = absolutePath(config.envDir, inputPath);
+  const normalizedPath = path.normalize(resolvedPath);
+  const allowed = allowedRoots.some((root) => {
+    const normalizedRoot = path.normalize(root);
+    return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}${path.sep}`);
+  });
+
+  if (!allowed) {
+    throw new Error(`Local path ${resolvedPath} is outside WEBEX_MCP_LOCAL_FILE_ROOTS.`);
+  }
+
+  return resolvedPath;
+}
+
 function sanitizeFilename(value) {
   return `${value || 'download'}`.replace(/[^\w.\-]+/g, '_');
 }
@@ -259,7 +312,7 @@ function errorText(message, extra = null) {
   return {content: [{type: 'text', text}], isError: true};
 }
 
-function createWebexApi(token, {baseDir} = {}) {
+function createWebexApi(token, {baseDir, resolveLocalPath} = {}) {
   async function request(endpoint, {method = 'GET', body, headers = {}} = {}) {
     const url = endpoint.startsWith('http') ? endpoint : `https://webexapis.com/v1${endpoint}`;
     const requestHeaders = {
@@ -359,7 +412,10 @@ function createWebexApi(token, {baseDir} = {}) {
     }
 
     for (const input of message.filePaths || []) {
-      const filePath = absolutePath(baseDir || process.cwd(), input);
+      if (!resolveLocalPath) {
+        throw new Error('Local file uploads are disabled for this Webex API context.');
+      }
+      const filePath = resolveLocalPath(input);
       const fileBuffer = fs.readFileSync(filePath);
       const blob = new Blob([fileBuffer]);
       form.append('files', blob, path.basename(filePath));
@@ -639,37 +695,85 @@ const runtime = {
   bot: null,
   user: null,
   index: null,
+  sdkHelper: null,
   sqliteBackend: null,
   sqliteLoadError: null,
-  backgroundSyncs: new Map(),
 };
+
+function closeSdkHelper() {
+  const helper = runtime.sdkHelper;
+  if (!helper) return;
+
+  runtime.sdkHelper = null;
+  helper.closed = true;
+
+  for (const pending of helper.pending.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error('SDK helper was closed.'));
+  }
+  helper.pending.clear();
+
+  try {
+    helper.rl.close();
+  } catch {}
+  try {
+    helper.child.kill();
+  } catch {}
+}
+
+process.on('exit', () => {
+  closeSdkHelper();
+});
 
 async function getActorContext(config, actor = 'auto') {
   let preferred = actor;
 
   if (actor === 'auto') {
-    try {
-      preferred = (await getUserToken(config, {refreshIfNeeded: true})) ? 'user' : 'bot';
-    } catch {
+    const hasConfiguredUserAuth = Boolean(
+      config.env.WEBEX_USER_TOKEN || fs.existsSync(getTokenFilePath(config))
+    );
+
+    if (!hasConfiguredUserAuth) {
       preferred = 'bot';
+    } else {
+      const userToken = await getUserToken(config, {refreshIfNeeded: true});
+      if (!userToken) {
+        throw new Error(
+          'User-scoped Webex auth is configured but unavailable. Fix WEBEX_USER_TOKEN or the OAuth token file instead of relying on actor:auto.'
+        );
+      }
+      preferred = 'user';
     }
   }
 
   if (preferred === 'bot') {
     if (runtime.bot) return runtime.bot;
     if (!config.env.WEBEX_BOT_TOKEN) throw new Error('WEBEX_BOT_TOKEN is required for bot-scoped actions');
-    const api = createWebexApi(config.env.WEBEX_BOT_TOKEN, {baseDir: config.envDir});
+    const api = createWebexApi(config.env.WEBEX_BOT_TOKEN, {
+      baseDir: config.envDir,
+      resolveLocalPath: (input) => resolveAllowedLocalPath(config, input),
+    });
     const me = await api.getMe();
     runtime.bot = {actor: 'bot', api, me};
     return runtime.bot;
   }
 
   const token = await getUserToken(config, {refreshIfNeeded: true});
-  if (!token) throw new Error('User-scoped Webex auth is unavailable. Configure WEBEX_READ_TOKEN or OAuth refresh credentials.');
+  if (!token) {
+    throw new Error(
+      'User-scoped Webex auth is unavailable. Configure WEBEX_USER_TOKEN or OAuth refresh credentials.'
+    );
+  }
 
   if (runtime.user?.token === token) return runtime.user;
+  if (runtime.user?.token && runtime.user.token !== token) {
+    closeSdkHelper();
+  }
 
-  const api = createWebexApi(token, {baseDir: config.envDir});
+  const api = createWebexApi(token, {
+    baseDir: config.envDir,
+    resolveLocalPath: (input) => resolveAllowedLocalPath(config, input),
+  });
   const me = await api.getMe();
   runtime.user = {actor: 'user', api, me, token};
   return runtime.user;
@@ -695,30 +799,23 @@ async function loadSqliteModule() {
   if (runtime.sqliteLoadError) return null;
 
   try {
-    if (process.versions?.bun) {
-      const {Database} = await import('bun:sqlite');
-      runtime.sqliteBackend = {
-        name: 'bun:sqlite',
-        open(file) {
-          const db = new Database(file);
-          return {
-            exec(sql) {
-              db.exec(sql);
-            },
-            prepare(sql) {
-              return db.query(sql);
-            },
-          };
-        },
-      };
-      return runtime.sqliteBackend;
+    if (!process.versions?.bun) {
+      throw new Error('This standalone MCP expects Bun for SQLite-backed indexing.');
     }
 
-    const sqlite = await import('node:sqlite');
+    const {Database} = await import('bun:sqlite');
     runtime.sqliteBackend = {
-      name: 'node:sqlite',
+      name: 'bun:sqlite',
       open(file) {
-        return new sqlite.DatabaseSync(file);
+        const db = new Database(file);
+        return {
+          exec(sql) {
+            db.exec(sql);
+          },
+          prepare(sql) {
+            return db.query(sql);
+          },
+        };
       },
     };
     return runtime.sqliteBackend;
@@ -906,8 +1003,11 @@ async function getIndexStore(config) {
   const dbPath = getIndexDbPath(config);
   if (runtime.index?.path === dbPath) return runtime.index;
 
-  ensureDir(path.dirname(dbPath));
+  ensurePrivateDir(path.dirname(dbPath));
   const db = sqlite.open(dbPath);
+  try {
+    fs.chmodSync(dbPath, 0o600);
+  } catch {}
   initializeIndexSchema(db);
 
   runtime.index = {
@@ -925,7 +1025,7 @@ async function requireIndexStore(config) {
   if (store) return store;
 
   throw new Error(
-    'Local indexing is unavailable because no supported built-in SQLite runtime was found. Use Bun or Node 22+.'
+    'Local indexing is unavailable because this standalone MCP expects Bun for SQLite-backed indexing.'
   );
 }
 
@@ -1360,7 +1460,7 @@ function coerceArray(value) {
 
 function requireDestination(args) {
   if (args.roomId || args.toPersonEmail || args.toPersonId) return;
-  throw new Error('Provide one destination: roomId, toPersonEmail, or toPersonId.');
+  throw new Error('Provide at least one destination: roomId, toPersonEmail, or toPersonId.');
 }
 
 function requireMessageContent(args) {
@@ -1370,6 +1470,17 @@ function requireMessageContent(args) {
 
   if (hasText || hasFiles || hasAttachments) return;
   throw new Error('Provide message content via text, markdown, html, filePaths, fileUrls, or attachments.');
+}
+
+function localFileToolsEnabled(config) {
+  return /^(1|true|yes)$/i.test(`${config.env.WEBEX_MCP_ALLOW_LOCAL_FILES || ''}`.trim());
+}
+
+function ensureLocalFileToolsEnabled(config, toolName) {
+  if (localFileToolsEnabled(config)) return;
+  throw new Error(
+    `${toolName} is disabled by default. Set WEBEX_MCP_ALLOW_LOCAL_FILES=true to enable local file access.`
+  );
 }
 
 async function enforceRoomWritePolicy(context, roomId) {
@@ -1415,52 +1526,148 @@ function extractLocalFileText(localPath, mimeType = '') {
   return JSON.parse(result.stdout.trim() || '{}');
 }
 
+async function createSdkHelperClient(token) {
+  const child = spawn('node', [getSdkHelperPath()], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: process.env,
+  });
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+
+  const rl = readline.createInterface({
+    input: child.stdout,
+    crlfDelay: Infinity,
+  });
+
+  const helper = {
+    token,
+    child,
+    rl,
+    pending: new Map(),
+    nextId: 1,
+    stderr: '',
+    ready: false,
+    closed: false,
+  };
+
+  const ready = new Promise((resolve, reject) => {
+    const fail = (error) => {
+      if (runtime.sdkHelper === helper) {
+        runtime.sdkHelper = null;
+      }
+      reject(error);
+    };
+
+    child.stderr.on('data', (chunk) => {
+      helper.stderr += chunk;
+      if (helper.stderr.length > 8000) {
+        helper.stderr = helper.stderr.slice(-8000);
+      }
+    });
+
+    child.on('exit', (code, signal) => {
+      const reason = signal ? `signal ${signal}` : `code ${code}`;
+      const error = new Error(helper.stderr.trim() || `SDK helper exited with ${reason}.`);
+      for (const pending of helper.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      }
+      helper.pending.clear();
+      if (!helper.closed) {
+        fail(error);
+      }
+    });
+
+    rl.on('line', (line) => {
+      if (!line.trim()) return;
+
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        const parseError = new Error(`SDK helper returned invalid JSON: ${error.message || String(error)}`);
+        if (!helper.ready) {
+          fail(parseError);
+          return;
+        }
+        for (const pending of helper.pending.values()) {
+          clearTimeout(pending.timer);
+          pending.reject(parseError);
+        }
+        helper.pending.clear();
+        return;
+      }
+
+      if (message.type === 'ready') {
+        helper.ready = true;
+        resolve(helper);
+        return;
+      }
+
+      if (message.type !== 'response' || !message.id) return;
+      const pending = helper.pending.get(message.id);
+      if (!pending) return;
+      helper.pending.delete(message.id);
+      clearTimeout(pending.timer);
+      if (message.ok) {
+        pending.resolve(message.result);
+      } else {
+        pending.reject(new Error(message.error || `SDK helper failed for ${pending.command}.`));
+      }
+    });
+  });
+
+  child.stdin.write(JSON.stringify({type: 'init', token}) + '\n');
+  return ready;
+}
+
+async function getSdkHelperClient(token) {
+  if (
+    runtime.sdkHelper &&
+    !runtime.sdkHelper.closed &&
+    runtime.sdkHelper.child.exitCode === null &&
+    runtime.sdkHelper.token === token
+  ) {
+    return runtime.sdkHelper;
+  }
+
+  closeSdkHelper();
+  runtime.sdkHelper = await createSdkHelperClient(token);
+  return runtime.sdkHelper;
+}
+
 async function runSdkHelper(config, actor, command, payload = {}, timeoutMs = 30000) {
   const context = await getActorContext(config, actor);
   if (context.actor !== 'user') {
     throw new Error('The SDK helper only supports the user actor because these capabilities depend on user-scoped internal services.');
   }
 
-  const result = spawnSync('node', [getSdkHelperPath(), command, JSON.stringify({...payload, timeoutMs})], {
-    encoding: 'utf8',
-    timeout: timeoutMs + 1000,
-    env: {
-      ...process.env,
-      WEBEX_HELPER_ACCESS_TOKEN: context.token,
-    },
+  const helper = await getSdkHelperClient(context.token);
+  const id = `${helper.nextId++}`;
+
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      helper.pending.delete(id);
+      reject(new Error(`SDK helper timed out while waiting for ${command}.`));
+    }, timeoutMs + 1000);
+
+    helper.pending.set(id, {resolve, reject, timer, command});
+    helper.child.stdin.write(
+      JSON.stringify({
+        type: 'call',
+        id,
+        command,
+        payload: {...payload, timeoutMs},
+      }) + '\n'
+    );
   });
-
-  if (result.error?.code === 'ETIMEDOUT') {
-    throw new Error(`SDK helper timed out while waiting for ${command}.`);
-  }
-
-  const stdout = `${result.stdout || ''}`.trim();
-  let body = null;
-
-  if (stdout) {
-    try {
-      body = JSON.parse(stdout);
-    } catch {
-      body = null;
-    }
-  }
-
-  if (result.status === 0 && body?.ok) return body.result;
-
-  const helperMessage =
-    body?.error ||
-    `${result.stderr || ''}`.trim() ||
-    `${result.stdout || ''}`.trim() ||
-    `SDK helper failed while running ${command}.`;
-
-  throw new Error(helperMessage);
 }
 
 async function downloadFileWithOptionalExtraction(config, actor, url, options = {}) {
   const context = await getActorContext(config, actor);
   const download = await context.api.downloadFile(url);
   const outputDir = absolutePath(config.envDir, options.outputDir || getDownloadRoot(config));
-  ensureDir(outputDir);
+  ensurePrivateDir(outputDir);
 
   const requestedName = options.filename ? sanitizeFilename(options.filename) : null;
   const derivedName =
@@ -2129,26 +2336,6 @@ function rankRooms(rooms, query, {roomType} = {}) {
   return ranked;
 }
 
-function rankMessages(messages, query, room) {
-  return messages
-    .map((message) => ({
-      message,
-      score: scoreSearchMatch(
-        query,
-        message.text,
-        message.markdown,
-        message.personEmail,
-        ...(message.files || []),
-        room?.title || ''
-      ),
-    }))
-    .filter((item) => item.score > 0)
-    .sort((left, right) => {
-      if (right.score !== left.score) return right.score - left.score;
-      return new Date(right.message.created || 0) - new Date(left.message.created || 0);
-    });
-}
-
 function buildLocalThreadsFromMessages(messages, maxResults = 20) {
   const byId = new Map(messages.map((message) => [message.id, message]));
   const repliesByParentId = new Map();
@@ -2299,192 +2486,6 @@ async function syncRoomHistoryIntoIndex(config, args = {}) {
   };
 }
 
-function getBackgroundSyncKey(actor, roomType = '') {
-  return `${actor}:${roomType || 'all'}`;
-}
-
-function summarizeBackgroundSyncState(state) {
-  return {
-    actor: state.actor,
-    roomType: state.roomType || null,
-    intervalSeconds: state.intervalSeconds,
-    maxRooms: state.maxRooms,
-    perRoomMessages: state.perRoomMessages,
-    running: Boolean(state.running),
-    startedAt: state.startedAt,
-    lastRunStartedAt: state.lastRunStartedAt || null,
-    lastRunFinishedAt: state.lastRunFinishedAt || null,
-    lastError: state.lastError || null,
-    lastResult: state.lastResult || null,
-  };
-}
-
-async function runBackgroundSyncPass(config, state) {
-  const context = await getActorContext(config, state.actor);
-  const store = await requireIndexStore(config);
-  const rooms = (await context.api.listRooms({max: state.maxRooms}))
-    .filter((room) => !state.roomType || room.type === state.roomType)
-    .sort((left, right) => new Date(right.lastActivity || 0) - new Date(left.lastActivity || 0));
-
-  const getCachedActivity = store.db.prepare('SELECT last_activity FROM rooms WHERE actor = ? AND id = ?');
-  const touchedRooms = [];
-  const failures = [];
-  let indexedMessageCount = 0;
-  let metadataOnlyRoomCount = 0;
-
-  for (const room of rooms) {
-    const cached = getCachedActivity.get(context.actor, room.id);
-    const unchanged = cached?.last_activity === (room.lastActivity || null);
-    if (unchanged) {
-      withTransaction(store.db, () => {
-        indexRoom(store, context.actor, room);
-      });
-      metadataOnlyRoomCount += 1;
-      continue;
-    }
-
-    try {
-      const messages = await context.api.listMessages({
-        roomId: room.id,
-        max: state.perRoomMessages,
-      });
-      indexedMessageCount += syncMessagesIntoIndex(store, context.actor, room, messages);
-      touchedRooms.push({
-        room: summarizeRoom(room),
-        messageCount: messages.length,
-      });
-    } catch (error) {
-      failures.push({
-        room: summarizeRoom(room),
-        error: error.message || String(error),
-      });
-    }
-  }
-
-  markSyncState(store, context.actor, 'background_sync', state.roomType || 'all');
-
-  return {
-    actor: context.actor,
-    roomType: state.roomType || null,
-    scannedRoomCount: rooms.length,
-    changedRoomCount: touchedRooms.length,
-    metadataOnlyRoomCount,
-    messageCount: indexedMessageCount,
-    failedRoomCount: failures.length,
-    failures,
-    rooms: touchedRooms,
-    index: {
-      dbPath: store.path,
-      backend: store.backend,
-    },
-  };
-}
-
-function scheduleBackgroundSync(config, key, state) {
-  if (state.stopped) return;
-
-  state.timer = setTimeout(async () => {
-    if (state.stopped || state.running) {
-      scheduleBackgroundSync(config, key, state);
-      return;
-    }
-
-    state.running = true;
-    state.lastRunStartedAt = new Date().toISOString();
-    state.lastError = null;
-
-    try {
-      state.lastResult = await runBackgroundSyncPass(config, state);
-    } catch (error) {
-      state.lastError = error.message || String(error);
-    } finally {
-      state.running = false;
-      state.lastRunFinishedAt = new Date().toISOString();
-      if (!state.stopped) scheduleBackgroundSync(config, key, state);
-    }
-  }, state.intervalSeconds * 1000);
-}
-
-async function startBackgroundSync(config, args = {}) {
-  const requestedActor = args.actor || 'auto';
-  const context = await getActorContext(config, requestedActor);
-  const key = getBackgroundSyncKey(context.actor, args.roomType || '');
-  const existing = runtime.backgroundSyncs.get(key);
-
-  if (existing) {
-    clearTimeout(existing.timer);
-    existing.stopped = true;
-  }
-
-  const state = {
-    actor: context.actor,
-    roomType: args.roomType || '',
-    intervalSeconds: Number(args.intervalSeconds || 30),
-    maxRooms: Number(args.maxRooms || 50),
-    perRoomMessages: Number(args.perRoomMessages || 50),
-    startedAt: new Date().toISOString(),
-    lastRunStartedAt: null,
-    lastRunFinishedAt: null,
-    lastError: null,
-    lastResult: null,
-    running: true,
-    stopped: false,
-    timer: null,
-  };
-
-  runtime.backgroundSyncs.set(key, state);
-  state.lastRunStartedAt = new Date().toISOString();
-
-  try {
-    state.lastResult = await runBackgroundSyncPass(config, state);
-  } catch (error) {
-    state.lastError = error.message || String(error);
-  } finally {
-    state.running = false;
-    state.lastRunFinishedAt = new Date().toISOString();
-    scheduleBackgroundSync(config, key, state);
-  }
-
-  return summarizeBackgroundSyncState(state);
-}
-
-function stopBackgroundSync(args = {}) {
-  const actor = args.actor || '';
-  const roomType = args.roomType || '';
-  const stopped = [];
-
-  for (const [key, state] of runtime.backgroundSyncs.entries()) {
-    if (actor && state.actor !== actor) continue;
-    if (roomType && state.roomType !== roomType) continue;
-    clearTimeout(state.timer);
-    state.stopped = true;
-    runtime.backgroundSyncs.delete(key);
-    stopped.push(summarizeBackgroundSyncState(state));
-  }
-
-  return {
-    stoppedCount: stopped.length,
-    syncs: stopped,
-  };
-}
-
-function getBackgroundSyncStatus(args = {}) {
-  const actor = args.actor || '';
-  const roomType = args.roomType || '';
-  const syncs = [];
-
-  for (const state of runtime.backgroundSyncs.values()) {
-    if (actor && state.actor !== actor) continue;
-    if (roomType && state.roomType !== roomType) continue;
-    syncs.push(summarizeBackgroundSyncState(state));
-  }
-
-  return {
-    count: syncs.length,
-    syncs,
-  };
-}
-
 const TOOLS = [
   {
     name: 'whoami',
@@ -2564,9 +2565,10 @@ const TOOLS = [
   {
     name: 'list_threads',
     description:
-      'Experimental user-only helper that asks the internal conversation SDK for thread summaries, optionally filtered to one room.',
+      'List thread roots for one room by grouping public room messages by parentId.',
     inputSchema: {
       type: 'object',
+      required: ['roomId'],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user']},
         roomId: {type: 'string'},
@@ -2769,6 +2771,10 @@ const TOOLS = [
       'Inspect meeting asset availability for a meetingId or recordingId, including recordings, transcripts, and summary access.',
     inputSchema: {
       type: 'object',
+      anyOf: [
+        {required: ['meetingId']},
+        {required: ['recordingId']},
+      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user']},
         meetingId: {type: 'string'},
@@ -2892,45 +2898,8 @@ const TOOLS = [
     },
   },
   {
-    name: 'start_background_sync',
-    description:
-      'Start a background polling loop that incrementally refreshes room metadata and recent messages into the local SQLite index.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        actor: {type: 'string', enum: ['auto', 'user', 'bot']},
-        roomType: {type: 'string', enum: ['direct', 'group']},
-        intervalSeconds: {type: 'integer', minimum: 5, maximum: 3600},
-        maxRooms: {type: 'integer', minimum: 1, maximum: 500},
-        perRoomMessages: {type: 'integer', minimum: 1, maximum: 200},
-      },
-    },
-  },
-  {
-    name: 'stop_background_sync',
-    description: 'Stop one or more background polling sync loops.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        actor: {type: 'string', enum: ['user', 'bot']},
-        roomType: {type: 'string', enum: ['direct', 'group']},
-      },
-    },
-  },
-  {
-    name: 'background_sync_status',
-    description: 'Show active background polling sync loops and their latest result.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        actor: {type: 'string', enum: ['user', 'bot']},
-        roomType: {type: 'string', enum: ['direct', 'group']},
-      },
-    },
-  },
-  {
     name: 'sync_recent_rooms',
-    description: 'Cache recent rooms and their latest messages into the local SQLite index for fast local-first search.',
+    description: 'Cache recent rooms and their latest messages into the local SQLite index for deterministic local search.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2958,6 +2927,10 @@ const TOOLS = [
     description: 'Cache one room thread history into the local SQLite index.',
     inputSchema: {
       type: 'object',
+      anyOf: [
+        {required: ['roomId']},
+        {required: ['space']},
+      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
         roomId: {type: 'string'},
@@ -2982,7 +2955,7 @@ const TOOLS = [
   },
   {
     name: 'search_rooms',
-    description: 'Search rooms by title, UUID, or link with lightweight fuzzy ranking.',
+    description: 'Search cached rooms by title, UUID, or link with lightweight fuzzy ranking.',
     inputSchema: {
       type: 'object',
       required: ['query'],
@@ -3219,7 +3192,7 @@ const TOOLS = [
   {
     name: 'search_messages',
     description:
-      'Search cached messages from the local SQLite index when available, otherwise fall back to recent live Webex history.',
+      'Search cached messages from the local SQLite index.',
     inputSchema: {
       type: 'object',
       required: ['query'],
@@ -3343,6 +3316,25 @@ const TOOLS = [
     description: 'Send a room or direct message as the selected actor, with support for markdown, html, files, and adaptive card attachments.',
     inputSchema: {
       type: 'object',
+      allOf: [
+        {
+          anyOf: [
+            {required: ['roomId']},
+            {required: ['toPersonEmail']},
+            {required: ['toPersonId']},
+          ],
+        },
+        {
+          anyOf: [
+            {required: ['text']},
+            {required: ['markdown']},
+            {required: ['html']},
+            {required: ['filePaths']},
+            {required: ['fileUrls']},
+            {required: ['attachments']},
+          ],
+        },
+      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
         roomId: {type: 'string'},
@@ -3363,6 +3355,11 @@ const TOOLS = [
     description: 'Build and send a richly formatted engineering update as markdown, html, or an adaptive card.',
     inputSchema: {
       type: 'object',
+      anyOf: [
+        {required: ['roomId']},
+        {required: ['toPersonEmail']},
+        {required: ['toPersonId']},
+      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
         roomId: {type: 'string'},
@@ -3604,29 +3601,18 @@ async function callTool(config, name, args = {}) {
       });
     }
     case 'list_threads': {
-      if (args.roomId) {
-        const context = await getActorContext(config, args.actor || 'auto');
-        const messages = await context.api.listMessages({
-          roomId: args.roomId,
-          max: 200,
-        });
-        const threads = buildLocalThreadsFromMessages(messages, args.maxResults || 20);
-        return jsonText({
-          actor: context.actor,
-          roomId: args.roomId,
-          count: threads.length,
-          threadSource: 'publicMessages',
-          threads,
-        });
-      }
-
-      const result = await runSdkHelper(config, args.actor || 'auto', 'list_threads', {
-        maxResults: args.maxResults || 20,
+      const context = await getActorContext(config, args.actor || 'auto');
+      const messages = await context.api.listMessages({
+        roomId: args.roomId,
+        max: 200,
       });
+      const threads = buildLocalThreadsFromMessages(messages, args.maxResults || 20);
       return jsonText({
-        actor: 'user',
-        threadSource: 'sdkHelper',
-        ...result,
+        actor: context.actor,
+        roomId: args.roomId,
+        count: threads.length,
+        threadSource: 'publicMessages',
+        threads,
       });
     }
     case 'list_meeting_transcripts': {
@@ -3897,15 +3883,6 @@ async function callTool(config, name, args = {}) {
         matches,
       });
     }
-    case 'start_background_sync': {
-      return jsonText(await startBackgroundSync(config, args));
-    }
-    case 'stop_background_sync': {
-      return jsonText(stopBackgroundSync(args));
-    }
-    case 'background_sync_status': {
-      return jsonText(getBackgroundSyncStatus(args));
-    }
     case 'sync_recent_rooms': {
       return jsonText(await syncRecentRoomsIntoIndex(config, args));
     }
@@ -3926,21 +3903,12 @@ async function callTool(config, name, args = {}) {
     case 'search_rooms': {
       const context = await getActorContext(config, args.actor || 'auto');
       const indexed = await searchIndexedRooms(config, context.actor, args);
-      if (indexed) {
-        return jsonText(indexed);
+      if (!indexed) {
+        throw new Error(
+          'Cached room metadata is unavailable. Run sync_all_rooms before using search_rooms.'
+        );
       }
-
-      const rooms = await context.api.listRooms({max: args.maxRooms || 5000});
-      const ranked = rankRooms(rooms, args.query, {roomType: args.roomType}).slice(0, args.maxResults || 20);
-      return jsonText({
-        actor: context.actor,
-        searchMode: 'liveApi',
-        count: ranked.length,
-        rooms: ranked.map((item) => ({
-          score: item.score,
-          room: summarizeRoom(item.room),
-        })),
-      });
+      return jsonText(indexed);
     }
     case 'get_room': {
       const context = await getActorContext(config, args.actor || 'auto');
@@ -4084,52 +4052,12 @@ async function callTool(config, name, args = {}) {
     case 'search_messages': {
       const context = await getActorContext(config, args.actor || 'auto');
       const indexed = await searchIndexedMessages(config, context.actor, args);
-      if (indexed) {
-        return jsonText(indexed);
+      if (!indexed) {
+        throw new Error(
+          'Cached message history is unavailable. Run sync_recent_rooms or sync_room_history before using search_messages.'
+        );
       }
-
-      const maxResults = args.maxResults || 20;
-      const perRoomMessages = args.perRoomMessages || 50;
-      let rooms = [];
-
-      if (args.roomId) {
-        rooms = [await context.api.getRoom(args.roomId)];
-      } else {
-        const candidateRooms = await context.api.listRooms({max: args.maxRooms || 40});
-        const roomQuery = args.roomQuery || args.query;
-        const rankedRooms = rankRooms(candidateRooms, roomQuery, {roomType: args.roomType});
-        rooms = (rankedRooms.length ? rankedRooms.map((item) => item.room) : candidateRooms)
-          .filter((room) => !args.roomType || room.type === args.roomType)
-          .slice(0, args.maxRooms || 20);
-      }
-
-      const matches = [];
-
-      for (const room of rooms) {
-        const messages = await context.api.listMessages({
-          roomId: room.id,
-          max: perRoomMessages,
-        });
-        for (const item of rankMessages(messages, args.query, room)) {
-          matches.push({
-            score: item.score,
-            room: summarizeRoom(room),
-            message: summarizeMessage(item.message),
-          });
-        }
-      }
-
-      matches.sort((left, right) => {
-        if (right.score !== left.score) return right.score - left.score;
-        return new Date(right.message.created || 0) - new Date(left.message.created || 0);
-      });
-
-      return jsonText({
-        actor: context.actor,
-        searchMode: 'liveApi',
-        count: Math.min(matches.length, maxResults),
-        results: matches.slice(0, maxResults),
-      });
+      return jsonText(indexed);
     }
     case 'get_message': {
       const context = await getActorContext(config, args.actor || 'auto');
@@ -4385,7 +4313,7 @@ async function callTool(config, name, args = {}) {
       });
     }
     case 'extract_local_file_text': {
-      const filePath = absolutePath(process.cwd(), args.filePath);
+      const filePath = resolveAllowedLocalPath(config, args.filePath);
       const extracted = extractLocalFileText(filePath, args.mimeType || '');
       return jsonText({
         filePath,

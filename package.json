@@ -9,8 +9,7 @@
     "auth:login": "bun oauth.mjs login --env-file .env.local",
     "auth:refresh": "bun oauth.mjs refresh --env-file .env.local",
     "auth:clear": "bun oauth.mjs clear --env-file .env.local",
-    "start": "bun server.mjs",
-    "start:env": "bun server.mjs --env-file .env.local",
+    "start": "bun server.mjs --env-file .env.local",
     "check": "bun --smol server.mjs </dev/null"
   },
   "packageManager": "bun@1.3.11",

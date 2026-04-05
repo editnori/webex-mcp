@@ -2,28 +2,28 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import crypto from 'node:crypto';
 import {spawn} from 'node:child_process';
+import {ensurePrivateDir, readJsonFile, writeJsonFile, withLockedFile} from './auth-store.mjs';
+
+const DEFAULT_STATE_DIR = path.join(
+  process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'),
+  'webex-mcp'
+);
+const DEFAULT_TOKEN_FILE = path.join(DEFAULT_STATE_DIR, 'tokens.json');
 
 const DEFAULT_SCOPES = [
   'spark:all',
-  'spark:calls_read',
-  'spark:calls_write',
-  'spark:recordings_read',
-  'spark:recordings_write',
   'spark:webhooks_read',
   'spark:webhooks_write',
   'meeting:schedules_read',
   'meeting:schedules_write',
   'meeting:recordings_read',
-  'meeting:recordings_write',
   'meeting:transcripts_read',
   'meeting:summaries_read',
-  'meeting:summaries_write',
-  'meeting:participants_read',
-  'meeting:participants_write',
   'meeting:controls_read',
   'meeting:controls_write',
   'meeting:preferences_read',
@@ -94,10 +94,25 @@ function parseEnvFile(file) {
 
 function loadConfig(envFile) {
   const fileEnv = parseEnvFile(envFile);
-  const env = {
-    ...fileEnv,
-    ...process.env,
-  };
+  const inheritedEnv = {...process.env};
+
+  if (envFile) {
+    for (const key of Object.keys(inheritedEnv)) {
+      if (key.startsWith('WEBEX_')) {
+        delete inheritedEnv[key];
+      }
+    }
+  }
+
+  const env = envFile
+    ? {
+        ...inheritedEnv,
+        ...fileEnv,
+      }
+    : {
+        ...fileEnv,
+        ...inheritedEnv,
+      };
 
   return {
     envFile,
@@ -112,22 +127,8 @@ function resolveMaybeRelative(baseDir, value, fallback = '') {
   return path.join(baseDir, value);
 }
 
-function readJson(file, fallback = null) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(file, data) {
-  fs.mkdirSync(path.dirname(file), {recursive: true});
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
 function getTokenFilePath(config) {
-  const configured = config.env.WEBEX_OAUTH_TOKEN_FILE || '.webex_tokens.json';
+  const configured = config.env.WEBEX_OAUTH_TOKEN_FILE || DEFAULT_TOKEN_FILE;
   return resolveMaybeRelative(config.envDir, configured);
 }
 
@@ -187,51 +188,58 @@ async function exchangeAuthorizationCode(config, code) {
 }
 
 async function refreshToken(config) {
-  const existing = readJson(getTokenFilePath(config), null);
-  if (!existing?.refresh_token) {
-    throw new Error('No refresh_token is stored yet. Run auth:login first.');
-  }
+  const tokenFile = getTokenFilePath(config);
+  return withLockedFile(tokenFile, async () => {
+    const existing = readJsonFile(tokenFile, null, {strict: true});
+    if (!existing?.refresh_token) {
+      throw new Error('No refresh_token is stored yet. Run auth:login first.');
+    }
 
-  const form = new URLSearchParams();
-  form.set('grant_type', 'refresh_token');
-  form.set('client_id', config.env.WEBEX_CLIENT_ID);
-  form.set('client_secret', config.env.WEBEX_CLIENT_SECRET);
-  form.set('refresh_token', existing.refresh_token);
-  form.set('redirect_uri', config.env.WEBEX_REDIRECT_URI);
+    const form = new URLSearchParams();
+    form.set('grant_type', 'refresh_token');
+    form.set('client_id', config.env.WEBEX_CLIENT_ID);
+    form.set('client_secret', config.env.WEBEX_CLIENT_SECRET);
+    form.set('refresh_token', existing.refresh_token);
+    form.set('redirect_uri', config.env.WEBEX_REDIRECT_URI);
 
-  const response = await fetch('https://webexapis.com/v1/access_token', {
-    method: 'POST',
-    headers: {'content-type': 'application/x-www-form-urlencoded'},
-    body: form.toString(),
-  });
+    const response = await fetch('https://webexapis.com/v1/access_token', {
+      method: 'POST',
+      headers: {'content-type': 'application/x-www-form-urlencoded'},
+      body: form.toString(),
+    });
 
-  const text = await response.text();
-  let body;
-  try {
-    body = text ? JSON.parse(text) : {};
-  } catch {
-    body = text;
-  }
+    const text = await response.text();
+    let body;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = text;
+    }
 
-  if (!response.ok) {
-    throw new Error(`Refresh failed with ${response.status}: ${JSON.stringify(body)}`);
-  }
+    if (!response.ok) {
+      throw new Error(`Refresh failed with ${response.status}: ${JSON.stringify(body)}`);
+    }
 
-  return persistToken(config, {
-    ...existing,
-    ...body,
+    return persistTokenUnlocked(tokenFile, {
+      ...existing,
+      ...body,
+    });
   });
 }
 
-function persistToken(config, body) {
-  const now = Date.now();
+async function persistToken(config, body) {
   const tokenFile = getTokenFilePath(config);
+  return withLockedFile(tokenFile, async () => persistTokenUnlocked(tokenFile, body));
+}
+
+function persistTokenUnlocked(tokenFile, body) {
+  const now = Date.now();
   const token = {
     ...body,
     obtained_at: now,
     expires_at: now + Number(body.expires_in || 0) * 1000,
   };
-  writeJson(tokenFile, token);
+  writeJsonFile(tokenFile, token);
   return {tokenFile, token};
 }
 
@@ -357,7 +365,7 @@ async function login(config, options = {}) {
 
 function describeStatus(config) {
   const tokenFile = getTokenFilePath(config);
-  const token = readJson(tokenFile, null);
+  const token = readJsonFile(tokenFile, null, {strict: true});
   if (!token?.access_token) {
     return {
       hasTokens: false,
@@ -381,6 +389,7 @@ function describeStatus(config) {
 
 function clearToken(config) {
   const tokenFile = getTokenFilePath(config);
+  ensurePrivateDir(path.dirname(tokenFile));
   if (fs.existsSync(tokenFile)) {
     fs.unlinkSync(tokenFile);
   }

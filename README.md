@@ -1,6 +1,6 @@
 ## Webex MCP
 
-Local stdio MCP server for Webex, extracted as a standalone Bun-managed repo.
+Local stdio MCP server for Webex, built as a Bun-first standalone repo.
 
 ### What It Exposes
 
@@ -15,9 +15,8 @@ Local stdio MCP server for Webex, extracted as a standalone Bun-managed repo.
 - user-scoped meeting transcript listing, download, and snippet search
 - local meeting transcript/recording-transcript indexing and search
 - local SQLite indexing for cached room/message search
-- local-first message search with live Webex fallback
+- cached message search backed by the local SQLite index
 - room sync tools for recent spaces or one room history
-- background polling sync to keep the local cache warm
 - people search and person lookup
 - membership listing, add, and remove
 - teams and team memberships
@@ -36,7 +35,7 @@ Local stdio MCP server for Webex, extracted as a standalone Bun-managed repo.
 
 ### Runtime
 
-- runtime: Bun
+- primary runtime: Bun
 - package manager: Bun
 - document extraction helper: `python3`
 - document extraction Python packages: `pypdf`, `python-pptx`, `openpyxl`
@@ -44,9 +43,9 @@ Local stdio MCP server for Webex, extracted as a standalone Bun-managed repo.
 
 ### Identity Model
 
-- `actor: "user"` uses `WEBEX_READ_TOKEN` or the OAuth refresh file
+- `actor: "user"` uses `WEBEX_USER_TOKEN` or the OAuth refresh file
 - `actor: "bot"` uses `WEBEX_BOT_TOKEN`
-- `actor: "auto"` prefers `user` when available, otherwise falls back to `bot`
+- `actor: "auto"` prefers `user` when it is configured and valid; it only falls back to `bot` when no user auth is configured
 
 This matters because:
 
@@ -58,10 +57,11 @@ This matters because:
 
 `send_message` supports:
 
-- `filePaths`: local file uploads from disk
+- `filePaths`: local file uploads from disk when `WEBEX_MCP_ENABLE_LOCAL_FILES=true`
 - `fileUrls`: remote URLs passed through to Webex
 
 `extract_message_files` downloads every file URL on a message and optionally extracts text.
+`extract_local_file_text` is also gated behind `WEBEX_MCP_ENABLE_LOCAL_FILES=true` and `WEBEX_MCP_LOCAL_FILE_ROOTS`.
 
 Rich send surfaces:
 
@@ -79,26 +79,37 @@ This MCP hard-blocks writes to large group rooms:
 ### Local Index
 
 The MCP can cache room and message history into a local SQLite database and use that cache for
-`search_messages` before falling back to live Webex API scans.
+`search_messages`.
 
 Recommended flow:
 
 1. Run `sync_all_rooms` once to cache all accessible room metadata.
 2. Use `search_rooms` and `resolve_space` against that cached room set.
 3. Run `sync_recent_rooms` to cache your most active room messages.
-4. Use `search_messages` for fast local-first lookup.
+4. Use `search_messages` for indexed local lookup.
 5. Run `sync_room_history` when you want deeper history for one room.
-6. Run `start_background_sync` if you want the cache refreshed continuously in the background.
 
 Notes:
 
 - the cache is actor-scoped, so bot-visible and user-visible data stay separated
 - attachment filenames are indexed through the message record; attachment body text is still opt-in via extraction tools
-- local index features prefer Bun's built-in SQLite and fall back to Node's built-in `node:sqlite`
-- use Bun for the cleanest setup; if you run under Node, use Node 22+
-- if no local cache is available yet, `search_messages` falls back to live Webex history
-- if no room cache is available yet, `search_rooms` falls back to a live Webex room scan
-- `start_background_sync` is polling-based today; it is practical for the MCP even though true Mercury-backed realtime sync is still experimental
+- local index features use Bun's built-in SQLite
+- `search_messages` and `search_rooms` are intentionally strict: if the cache is missing, they fail and tell you which sync tool to run
+
+### Webhooks
+
+This MCP can manage Webex webhook objects:
+
+- `list_webhooks`
+- `get_webhook`
+- `create_webhook`
+- `update_webhook`
+- `delete_webhook`
+
+Important:
+
+- this standalone MCP does not host a webhook receiver
+- the webhook tools are CRUD helpers for remote Webex webhook registration only
 
 ### Experimental Read State
 
@@ -130,7 +141,7 @@ Notes:
 
 - these are user-only, not bot-only
 - they use internal SDK paths and may time out if the required internal Webex services are unavailable
-- room-scoped `list_threads` is available today by grouping public room messages by `parentId`
+- `list_threads` is room-scoped and derives thread roots from public room messages grouped by `parentId`
 - `list_thread_replies` is different: it is a normal MCP wrapper over `list_messages(parentId=...)`
 
 ### Meetings And Recordings
@@ -210,7 +221,7 @@ What it does:
 - starts a tiny local callback listener using `WEBEX_REDIRECT_URI`
 - opens the Webex authorization URL in your browser
 - exchanges the returned code for tokens
-- writes `.webex_tokens.json`
+- writes the token file configured by `WEBEX_OAUTH_TOKEN_FILE`
 
 Useful commands:
 
@@ -225,20 +236,21 @@ Notes:
 - normal access-token expiry does not require a full reauth; `server.mjs` already refreshes via the stored `refresh_token`
 - you usually only need `auth:login` again when scopes change, the refresh token expires, or the grant is revoked
 - if you prefer another env file, use `bun oauth.mjs <command> --env-file /abs/path/.env.local`
+- when `--env-file` is passed, that file is authoritative over Bun's auto-loaded env variables
 
 ### Publish Safety
 
-Before publishing this repo:
+Before publishing or sharing this repo:
 
 - keep real credentials only in ignored env files such as `.env.local`
-- keep OAuth grants only in `.webex_tokens.json`
-- do not commit `.data/` because it can contain cached room history, downloads, and SQLite indexes
+- keep OAuth grants only in the token file configured by `WEBEX_OAUTH_TOKEN_FILE`
+- do not commit your local state dir because it can contain cached room history, downloads, and SQLite indexes
+- local file access is intentionally off by default; only enable it with a tight `WEBEX_MCP_LOCAL_FILE_ROOTS` allowlist
 - review README examples if you adapted them to a local environment
 
 This repo already ignores:
 
 - `.env*` except `.env.example`
-- `.webex_tokens.json`
 - `.data/`
 - `node_modules/`
 
@@ -265,7 +277,7 @@ Standalone flow:
 cd webex-mcp
 cp .env.example .env.local
 bun run auth:login
-bun run start:env
+bun run start
 ```
 
 ### Codex Config
@@ -282,5 +294,8 @@ Then restart Codex so it loads the new MCP server.
 
 ### Useful Env Vars
 
-- `WEBEX_MCP_DOWNLOAD_DIR` overrides the download directory for file tools
-- `WEBEX_MCP_INDEX_DB` overrides the SQLite index path
+- `WEBEX_OAUTH_TOKEN_FILE` overrides the token file location. By default it uses your per-user state dir.
+- `WEBEX_MCP_DOWNLOAD_DIR` overrides the download directory for file tools. By default it uses your per-user state dir.
+- `WEBEX_MCP_INDEX_DB` overrides the SQLite index path. By default it uses your per-user state dir.
+- `WEBEX_MCP_ENABLE_LOCAL_FILES=true` enables `filePaths` uploads and `extract_local_file_text`.
+- `WEBEX_MCP_LOCAL_FILE_ROOTS` is a `:`-separated allowlist for local file access.
