@@ -254,6 +254,9 @@ function openBrowser(url) {
   } else if (platform === 'win32') {
     command = 'cmd';
     args = ['/c', 'start', '', url];
+  } else if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) {
+    command = 'cmd.exe';
+    args = ['/c', 'start', '', url];
   } else {
     command = 'xdg-open';
     args = [url];
@@ -262,6 +265,9 @@ function openBrowser(url) {
   const child = spawn(command, args, {
     detached: true,
     stdio: 'ignore',
+  });
+  child.on('error', () => {
+    // The authorize URL is printed for manual copy/paste when no opener exists, e.g. minimal WSL.
   });
   child.unref();
 }

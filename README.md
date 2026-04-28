@@ -202,7 +202,7 @@ Notes:
 - `list_call_detail_records` calls `analytics-calling.webexapis.com/v1/cdr_feed` and is limited to 12 hours per request
 - `list_live_call_detail_records` calls `analytics-calling.webexapis.com/v1/cdr_stream` and is limited to 2 hours per request
 - if Webex returns a regional endpoint hint, set `WEBEX_CALLING_CDR_BASE_URL` or pass `baseUrl` to the tool
-- `spark-admin:locations_read` is optional, but useful when filtering or labeling CDR results by Webex Calling location
+- `spark-admin:locations_read` is optional for location metadata, but do not request it unless the integration has that scope selected in the Webex developer portal
 
 ### Install
 
