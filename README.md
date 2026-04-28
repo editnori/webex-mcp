@@ -151,6 +151,7 @@ These tools use the Webex meeting APIs with the user OAuth token:
 - `create_meeting`
 - `list_recordings`
 - `list_meetings`
+- `list_meeting_participants`
 - `get_meeting`
 - `update_meeting`
 - `delete_meeting`
@@ -181,9 +182,27 @@ Notes:
 - top-level `meetingPreferences` is read-only; writable preference surfaces are `audio`, `schedulingOptions`, and `personalMeetingRoom`
 - `update_meeting_audio_preferences` automatically normalizes empty phone numbers so the Webex API accepts the payload
 - meeting controls are a live-meeting surface; the MCP exposes the raw controls object, but the resource only exists when Webex exposes `/meetings/{meetingId}/controls`
+- `list_meeting_participants` exposes actual meeting attendance rows when Webex makes participant data available to the OAuth user
 - `get_recording_transcript` uses the temporary transcript link exposed by the recording detail response when one exists
 - `get_meeting_transcript` downloads either `txt` or `vtt` content directly from the transcript download link
 - `sync_recent_meeting_content` indexes transcript text from both transcript endpoints and recording transcript links into the local SQLite index
+
+### Webex Calling CDR
+
+These tools use the Webex Calling Detailed Call History APIs:
+
+- `list_call_detail_records`
+- `list_live_call_detail_records`
+
+Notes:
+
+- they are user-only, not bot-only
+- they require `spark-admin:calling_cdr_read` on the OAuth grant
+- the authenticating user must also have the Control Hub role `Webex Calling Detailed Call History API access`
+- `list_call_detail_records` calls `analytics-calling.webexapis.com/v1/cdr_feed` and is limited to 12 hours per request
+- `list_live_call_detail_records` calls `analytics-calling.webexapis.com/v1/cdr_stream` and is limited to 2 hours per request
+- if Webex returns a regional endpoint hint, set `WEBEX_CALLING_CDR_BASE_URL` or pass `baseUrl` to the tool
+- `spark-admin:locations_read` is optional, but useful when filtering or labeling CDR results by Webex Calling location
 
 ### Install
 
@@ -291,6 +310,41 @@ args = ["/absolute/path/to/webex-mcp/server.mjs", "--env-file", "/absolute/path/
 ```
 
 Then restart Codex so it loads the new MCP server.
+
+### Claude Code Config
+
+If you want Claude Code to use this same local MCP instead of a hosted Webex endpoint,
+point its plugin or `.mcp.json` entry at the same stdio server:
+
+```json
+{
+  "mcpServers": {
+    "webex": {
+      "type": "stdio",
+      "command": "bun",
+      "args": [
+        "/absolute/path/to/webex-mcp/server.mjs",
+        "--env-file",
+        "/absolute/path/to/webex-mcp/.env.local"
+      ]
+    }
+  }
+}
+```
+
+If Claude points at a remote HTTP MCP while Codex points at this local repo, fixes in this repo
+will only affect Codex.
+
+### Tool Schema Compatibility
+
+Some MCP clients reject tool parameter schemas unless the top-level `inputSchema` is a plain
+`type: "object"` without top-level `allOf`, `anyOf`, `oneOf`, `enum`, or `not`.
+
+This repo now validates that constraint at load time and in `bun run check`.
+
+When a tool needs conditional requirements such as "provide `meetingId` or `recordingId`", keep
+the runtime guard in code and describe the constraint in the relevant property descriptions instead
+of using top-level schema combinators.
 
 ### Useful Env Vars
 

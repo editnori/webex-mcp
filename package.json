@@ -10,7 +10,8 @@
     "auth:refresh": "bun oauth.mjs refresh --env-file .env.local",
     "auth:clear": "bun oauth.mjs clear --env-file .env.local",
     "start": "bun server.mjs --env-file .env.local",
-    "check": "bun --smol server.mjs </dev/null"
+    "check:tool-schemas": "bun scripts/validate-tool-schemas.mjs",
+    "check": "bun run check:tool-schemas"
   },
   "packageManager": "bun@1.3.11",
   "dependencies": {

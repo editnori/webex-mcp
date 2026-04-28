@@ -20,6 +20,9 @@ const DEFAULT_INDEX_DB = path.join(DEFAULT_STATE_DIR, 'index.sqlite');
 const DEFAULT_TOKEN_FILE = path.join(DEFAULT_STATE_DIR, 'tokens.json');
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_WRITABLE_GROUP_MEMBERS = 19;
+const DEFAULT_CALLING_CDR_BASE_URL = 'https://analytics-calling.webexapis.com/v1';
+const MAX_CDR_FEED_WINDOW_MS = 12 * 60 * 60 * 1000;
+const MAX_CDR_STREAM_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 function parseArgs(argv) {
   const out = {
@@ -227,11 +230,15 @@ function buildQuery(params = {}) {
 
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null || value === '') continue;
-    query.set(key, `${value}`);
+    query.set(key, Array.isArray(value) ? value.join(',') : `${value}`);
   }
 
   const encoded = query.toString();
   return encoded ? `?${encoded}` : '';
+}
+
+function trimTrailingSlash(value) {
+  return `${value || ''}`.replace(/\/+$/, '');
 }
 
 function absolutePath(baseDir, value) {
@@ -312,7 +319,9 @@ function errorText(message, extra = null) {
   return {content: [{type: 'text', text}], isError: true};
 }
 
-function createWebexApi(token, {baseDir, resolveLocalPath} = {}) {
+function createWebexApi(token, {baseDir, resolveLocalPath, cdrBaseUrl} = {}) {
+  const callingCdrBaseUrl = trimTrailingSlash(cdrBaseUrl || DEFAULT_CALLING_CDR_BASE_URL);
+
   async function request(endpoint, {method = 'GET', body, headers = {}} = {}) {
     const url = endpoint.startsWith('http') ? endpoint : `https://webexapis.com/v1${endpoint}`;
     const requestHeaders = {
@@ -389,6 +398,54 @@ function createWebexApi(token, {baseDir, resolveLocalPath} = {}) {
     }
 
     return items.slice(0, total);
+  }
+
+  async function listAbsoluteCollection(initialUrl, label, options = {}, pageSize = DEFAULT_PAGE_SIZE) {
+    const total = Number(options.max || pageSize);
+    const items = [];
+    let url = initialUrl;
+
+    while (url && items.length < total) {
+      let response;
+      let body;
+      for (let attempt = 0; ; attempt += 1) {
+        ({response, body} = await fetchJson(url, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }));
+
+        if (response.ok || response.status !== 429 || attempt >= 4) break;
+        await sleep(getRetryDelayMs(response, attempt));
+      }
+
+      if (!response.ok) {
+        const error = new Error(`Webex API GET ${label} failed with ${response.status}`);
+        error.status = response.status;
+        error.body = body;
+        throw error;
+      }
+
+      items.push(...(body.items || []));
+      url = body.next || parseNextLinkHeader(response.headers.get('link')) || null;
+    }
+
+    return items.slice(0, total);
+  }
+
+  function listCallingCdrCollection(resource, options = {}, pageSize = DEFAULT_PAGE_SIZE) {
+    const total = Number(options.max || pageSize);
+    const perPage = Math.min(Math.max(total, 1), 100);
+    const query = {
+      ...options,
+      max: perPage,
+    };
+    delete query.baseUrl;
+    delete query.endpoint;
+
+    const baseUrl = trimTrailingSlash(options.baseUrl || callingCdrBaseUrl);
+    const url = `${baseUrl}${resource}${buildQuery(query)}`;
+    return listAbsoluteCollection(url, `${baseUrl}${resource}`, options, pageSize);
   }
 
   function buildMultipartMessage(message) {
@@ -556,6 +613,9 @@ function createWebexApi(token, {baseDir, resolveLocalPath} = {}) {
     listMeetingSummaries(options = {}) {
       return listCollection('/meetingSummaries', options, Number(options.max || 20));
     },
+    listMeetingParticipants(options = {}) {
+      return listCollection('/meetingParticipants', options, Number(options.max || 100));
+    },
     getRecording(recordingId) {
       return request(`/recordings/${encodeURIComponent(recordingId)}`);
     },
@@ -574,6 +634,12 @@ function createWebexApi(token, {baseDir, resolveLocalPath} = {}) {
         options,
         Number(options.max || 100)
       );
+    },
+    listCallDetailRecords(options = {}) {
+      return listCallingCdrCollection('/cdr_feed', options, Number(options.max || 100));
+    },
+    listLiveCallDetailRecords(options = {}) {
+      return listCallingCdrCollection('/cdr_stream', options, Number(options.max || 100));
     },
     createAttachmentAction(body) {
       return request('/attachment/actions', {
@@ -752,6 +818,7 @@ async function getActorContext(config, actor = 'auto') {
     const api = createWebexApi(config.env.WEBEX_BOT_TOKEN, {
       baseDir: config.envDir,
       resolveLocalPath: (input) => resolveAllowedLocalPath(config, input),
+      cdrBaseUrl: config.env.WEBEX_CALLING_CDR_BASE_URL,
     });
     const me = await api.getMe();
     runtime.bot = {actor: 'bot', api, me};
@@ -773,6 +840,7 @@ async function getActorContext(config, actor = 'auto') {
   const api = createWebexApi(token, {
     baseDir: config.envDir,
     resolveLocalPath: (input) => resolveAllowedLocalPath(config, input),
+    cdrBaseUrl: config.env.WEBEX_CALLING_CDR_BASE_URL,
   });
   const me = await api.getMe();
   runtime.user = {actor: 'user', api, me, token};
@@ -1472,15 +1540,53 @@ function requireMessageContent(args) {
   throw new Error('Provide message content via text, markdown, html, filePaths, fileUrls, or attachments.');
 }
 
-function localFileToolsEnabled(config) {
-  return /^(1|true|yes)$/i.test(`${config.env.WEBEX_MCP_ALLOW_LOCAL_FILES || ''}`.trim());
+const DISALLOWED_TOP_LEVEL_TOOL_SCHEMA_KEYS = ['allOf', 'anyOf', 'enum', 'not', 'oneOf'];
+
+function validateToolInputSchema(tool) {
+  if (!isPlainObject(tool)) {
+    throw new Error('Tool definitions must be plain objects.');
+  }
+
+  if (!tool.name || typeof tool.name !== 'string') {
+    throw new Error('Each tool definition must include a non-empty string name.');
+  }
+
+  if (!isPlainObject(tool.inputSchema)) {
+    throw new Error(`Tool "${tool.name}" must expose inputSchema as a plain object.`);
+  }
+
+  if (tool.inputSchema.type !== 'object') {
+    throw new Error(`Tool "${tool.name}" must expose an object inputSchema.`);
+  }
+
+  const forbiddenKeys = DISALLOWED_TOP_LEVEL_TOOL_SCHEMA_KEYS.filter((key) =>
+    Object.prototype.hasOwnProperty.call(tool.inputSchema, key)
+  );
+
+  if (forbiddenKeys.length > 0) {
+    throw new Error(
+      `Tool "${tool.name}" uses unsupported top-level inputSchema keys: ${forbiddenKeys.join(
+        ', '
+      )}. Move those constraints into runtime validation or property descriptions.`
+    );
+  }
 }
 
-function ensureLocalFileToolsEnabled(config, toolName) {
-  if (localFileToolsEnabled(config)) return;
-  throw new Error(
-    `${toolName} is disabled by default. Set WEBEX_MCP_ALLOW_LOCAL_FILES=true to enable local file access.`
-  );
+function validatePublishedToolSchemas(tools) {
+  if (!Array.isArray(tools)) {
+    throw new Error('Published tools must be an array.');
+  }
+
+  const seenNames = new Set();
+  for (const tool of tools) {
+    validateToolInputSchema(tool);
+    if (seenNames.has(tool.name)) {
+      throw new Error(`Duplicate tool definition found for "${tool.name}".`);
+    }
+    seenNames.add(tool.name);
+  }
+
+  return tools;
 }
 
 async function enforceRoomWritePolicy(context, roomId) {
@@ -1940,6 +2046,31 @@ function summarizeMeeting(meeting) {
   };
 }
 
+function summarizeMeetingParticipant(participant) {
+  const joinedTime = participant.joinedTime || participant.joinTime || participant.joined || null;
+  const leftTime = participant.leftTime || participant.leaveTime || participant.left || null;
+  const durationSeconds =
+    Number(participant.durationSeconds ?? participant.duration ?? participant.totalDurationSeconds ?? 0) || 0;
+
+  return {
+    id: participant.id || null,
+    meetingId: participant.meetingId || null,
+    meetingSeriesId: participant.meetingSeriesId || null,
+    personId: participant.personId || participant.userId || null,
+    personEmail: participant.personEmail || participant.email || '',
+    displayName: participant.displayName || participant.name || participant.personName || '',
+    state: participant.state || '',
+    role: participant.role || participant.participantRole || '',
+    joinedTime,
+    leftTime,
+    durationSeconds,
+    isHost: Boolean(participant.host || participant.isHost),
+    isCohost: Boolean(participant.cohost || participant.isCohost),
+    deviceType: participant.deviceType || '',
+    clientType: participant.clientType || '',
+  };
+}
+
 function summarizeMeetingSitesResponse(value) {
   const sites = Array.isArray(value?.sites) ? value.sites : [];
   return {
@@ -2025,6 +2156,148 @@ function summarizeMeetingContentRow(row) {
     hostEmail: row.host_email || '',
     created: row.created || null,
     contentPreview: limitText(row.content || '', 500),
+  };
+}
+
+function parseIsoTime(value, fieldName) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error(`Provide a valid ISO timestamp for ${fieldName}.`);
+  }
+  return timestamp;
+}
+
+function enforceCallDetailWindow(args, maxWindowMs, label) {
+  if (!args.startTime || !args.endTime) {
+    throw new Error('Provide startTime and endTime as ISO timestamps.');
+  }
+
+  const startMs = parseIsoTime(args.startTime, 'startTime');
+  const endMs = parseIsoTime(args.endTime, 'endTime');
+
+  if (endMs <= startMs) {
+    throw new Error('endTime must be after startTime.');
+  }
+
+  if (endMs - startMs > maxWindowMs) {
+    const maxHours = maxWindowMs / (60 * 60 * 1000);
+    throw new Error(`${label} can query at most ${maxHours} hours per request.`);
+  }
+}
+
+function firstPresent(record, keys) {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return null;
+}
+
+function parseDurationSeconds(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+
+  const text = `${value}`.trim();
+  if (!text) return 0;
+  if (/^\d+(\.\d+)?$/.test(text)) return Number(text);
+
+  const hms = text.match(/^(\d+):(\d{2}):(\d{2})(?:\.\d+)?$/);
+  if (hms) {
+    return Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3]);
+  }
+
+  const ms = text.match(/^(\d+):(\d{2})(?:\.\d+)?$/);
+  if (ms) {
+    return Number(ms[1]) * 60 + Number(ms[2]);
+  }
+
+  return 0;
+}
+
+function normalizeDigits(value) {
+  return `${value || ''}`.replace(/\D+/g, '');
+}
+
+function summarizeCallDetailRecord(record, {includeRaw = false} = {}) {
+  const durationSeconds = parseDurationSeconds(
+    firstPresent(record, [
+      'Duration',
+      'Call duration',
+      'Call Duration',
+      'Call duration seconds',
+      'Call Duration Seconds',
+      'duration',
+      'durationSeconds',
+    ])
+  );
+
+  const summary = {
+    callId: firstPresent(record, ['Call ID', 'Call Id', 'callId', 'id']),
+    correlationId: firstPresent(record, ['Correlation ID', 'Correlation Id', 'correlationId']),
+    userId: firstPresent(record, ['User ID', 'User Id', 'userId', 'Person ID', 'personId']),
+    userEmail: firstPresent(record, ['User email', 'User Email', 'userEmail', 'Email', 'email']),
+    userName: firstPresent(record, ['User name', 'User Name', 'userName', 'Name', 'name']),
+    location: firstPresent(record, ['Location', 'Location name', 'Location Name', 'locationName']),
+    departmentId: firstPresent(record, ['Department ID', 'Department Id', 'departmentId']),
+    startTime: firstPresent(record, ['Start time', 'Start Time', 'Start time UTC', 'startTime']),
+    answerTime: firstPresent(record, ['Answer time', 'Answer Time', 'answerTime']),
+    releaseTime: firstPresent(record, ['Release time', 'Release Time', 'End time', 'End Time', 'endTime']),
+    durationSeconds,
+    answered: firstPresent(record, ['Answered', 'answered', 'Answer indicator', 'Answer Indicator']),
+    direction: firstPresent(record, ['Direction', 'direction', 'Personality', 'personality']),
+    callType: firstPresent(record, ['Call type', 'Call Type', 'callType']),
+    callOutcome: firstPresent(record, ['Call outcome', 'Call Outcome', 'callOutcome']),
+    callOutcomeReason: firstPresent(record, ['Call outcome reason', 'Call Outcome Reason', 'callOutcomeReason']),
+    callingNumber: firstPresent(record, ['Calling number', 'Calling Number', 'callingNumber']),
+    calledNumber: firstPresent(record, ['Called number', 'Called Number', 'calledNumber']),
+    callingLineId: firstPresent(record, ['Calling line ID', 'Calling Line ID', 'callingLineId']),
+    calledLineId: firstPresent(record, ['Called line ID', 'Called Line ID', 'calledLineId']),
+    clientType: firstPresent(record, ['Client type', 'Client Type', 'clientType']),
+    clientVersion: firstPresent(record, ['Client version', 'Client Version', 'clientVersion']),
+  };
+
+  if (includeRaw) summary.raw = record;
+  return summary;
+}
+
+function callDetailMatchesFilter(record, args = {}) {
+  const haystack = JSON.stringify(record).toLowerCase();
+
+  if (args.personEmail && !haystack.includes(`${args.personEmail}`.toLowerCase())) {
+    return false;
+  }
+
+  if (args.personName && !haystack.includes(`${args.personName}`.toLowerCase())) {
+    return false;
+  }
+
+  if (args.number) {
+    const needle = normalizeDigits(args.number);
+    if (needle && !normalizeDigits(haystack).includes(needle)) return false;
+  }
+
+  return true;
+}
+
+function summarizeCallDetailRecords(records) {
+  const summaries = records.map((record) => summarizeCallDetailRecord(record));
+  const totalDurationSeconds = summaries.reduce((total, record) => total + (record.durationSeconds || 0), 0);
+  const byCallType = {};
+  const byDirection = {};
+
+  for (const record of summaries) {
+    const callType = record.callType || 'unknown';
+    const direction = record.direction || 'unknown';
+    byCallType[callType] = (byCallType[callType] || 0) + 1;
+    byDirection[direction] = (byDirection[direction] || 0) + 1;
+  }
+
+  return {
+    recordCount: records.length,
+    totalDurationSeconds,
+    totalDurationMinutes: Math.round((totalDurationSeconds / 60) * 10) / 10,
+    byCallType,
+    byDirection,
   };
 }
 
@@ -2486,7 +2759,7 @@ async function syncRoomHistoryIntoIndex(config, args = {}) {
   };
 }
 
-const TOOLS = [
+const TOOLS = validatePublishedToolSchemas([
   {
     name: 'whoami',
     description: 'Show the Webex identity for the selected actor.',
@@ -2587,6 +2860,20 @@ const TOOLS = [
         from: {type: 'string'},
         to: {type: 'string'},
         max: {type: 'integer', minimum: 1, maximum: 200},
+      },
+    },
+  },
+  {
+    name: 'list_meeting_participants',
+    description:
+      'List participant attendance rows for a meetingId via the user OAuth token. Use this to measure actual join/leave duration when Webex exposes participant data.',
+    inputSchema: {
+      type: 'object',
+      required: ['meetingId'],
+      properties: {
+        actor: {type: 'string', enum: ['auto', 'user']},
+        meetingId: {type: 'string'},
+        max: {type: 'integer', minimum: 1, maximum: 500},
       },
     },
   },
@@ -2771,14 +3058,10 @@ const TOOLS = [
       'Inspect meeting asset availability for a meetingId or recordingId, including recordings, transcripts, and summary access.',
     inputSchema: {
       type: 'object',
-      anyOf: [
-        {required: ['meetingId']},
-        {required: ['recordingId']},
-      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user']},
-        meetingId: {type: 'string'},
-        recordingId: {type: 'string'},
+        meetingId: {type: 'string', description: 'Required if recordingId is not provided'},
+        recordingId: {type: 'string', description: 'Required if meetingId is not provided'},
         maxTranscripts: {type: 'integer', minimum: 1, maximum: 100},
       },
     },
@@ -2808,6 +3091,48 @@ const TOOLS = [
         to: {type: 'string'},
         max: {type: 'integer', minimum: 1, maximum: 200},
         sharedOnly: {type: 'boolean'},
+      },
+    },
+  },
+  {
+    name: 'list_call_detail_records',
+    description:
+      'List Webex Calling Detailed Call History records from analytics-calling /cdr_feed. Requires spark-admin:calling_cdr_read and the Control Hub Detailed Call History API access role. Each request is limited to a 12-hour window.',
+    inputSchema: {
+      type: 'object',
+      required: ['startTime', 'endTime'],
+      properties: {
+        actor: {type: 'string', enum: ['auto', 'user']},
+        startTime: {type: 'string', description: 'ISO timestamp. Must be within 30 days and at least 5 minutes before now.'},
+        endTime: {type: 'string', description: 'ISO timestamp after startTime. Maximum 12 hours after startTime.'},
+        locations: {type: 'array', items: {type: 'string'}, description: 'Optional Webex Calling location ids or names to pass to the CDR API.'},
+        baseUrl: {type: 'string', description: `Optional regional base URL. Defaults to ${DEFAULT_CALLING_CDR_BASE_URL}.`},
+        max: {type: 'integer', minimum: 1, maximum: 1000},
+        personEmail: {type: 'string', description: 'Optional local filter across returned CDR fields.'},
+        personName: {type: 'string', description: 'Optional local filter across returned CDR fields.'},
+        number: {type: 'string', description: 'Optional local phone/extension filter across returned CDR fields.'},
+        includeRaw: {type: 'boolean', description: 'Include raw CDR records in each summarized result.'},
+      },
+    },
+  },
+  {
+    name: 'list_live_call_detail_records',
+    description:
+      'List near-real-time Webex Calling Detailed Call History records from analytics-calling /cdr_stream. Requires spark-admin:calling_cdr_read and the Control Hub Detailed Call History API access role. Each request is limited to a 2-hour window.',
+    inputSchema: {
+      type: 'object',
+      required: ['startTime', 'endTime'],
+      properties: {
+        actor: {type: 'string', enum: ['auto', 'user']},
+        startTime: {type: 'string', description: 'ISO timestamp.'},
+        endTime: {type: 'string', description: 'ISO timestamp after startTime. Maximum 2 hours after startTime.'},
+        locations: {type: 'array', items: {type: 'string'}, description: 'Optional Webex Calling location ids or names to pass to the CDR API.'},
+        baseUrl: {type: 'string', description: `Optional regional base URL. Defaults to ${DEFAULT_CALLING_CDR_BASE_URL}.`},
+        max: {type: 'integer', minimum: 1, maximum: 1000},
+        personEmail: {type: 'string', description: 'Optional local filter across returned CDR fields.'},
+        personName: {type: 'string', description: 'Optional local filter across returned CDR fields.'},
+        number: {type: 'string', description: 'Optional local phone/extension filter across returned CDR fields.'},
+        includeRaw: {type: 'boolean', description: 'Include raw CDR records in each summarized result.'},
       },
     },
   },
@@ -2927,14 +3252,10 @@ const TOOLS = [
     description: 'Cache one room thread history into the local SQLite index.',
     inputSchema: {
       type: 'object',
-      anyOf: [
-        {required: ['roomId']},
-        {required: ['space']},
-      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
-        roomId: {type: 'string'},
-        space: {type: 'string'},
+        roomId: {type: 'string', description: 'Required if space is not provided'},
+        space: {type: 'string', description: 'Required if roomId is not provided'},
         maxMessages: {type: 'integer', minimum: 1, maximum: 1000},
         before: {type: 'string'},
         beforeMessage: {type: 'string'},
@@ -3316,34 +3637,15 @@ const TOOLS = [
     description: 'Send a room or direct message as the selected actor, with support for markdown, html, files, and adaptive card attachments.',
     inputSchema: {
       type: 'object',
-      allOf: [
-        {
-          anyOf: [
-            {required: ['roomId']},
-            {required: ['toPersonEmail']},
-            {required: ['toPersonId']},
-          ],
-        },
-        {
-          anyOf: [
-            {required: ['text']},
-            {required: ['markdown']},
-            {required: ['html']},
-            {required: ['filePaths']},
-            {required: ['fileUrls']},
-            {required: ['attachments']},
-          ],
-        },
-      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
-        roomId: {type: 'string'},
-        toPersonEmail: {type: 'string'},
-        toPersonId: {type: 'string'},
+        roomId: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
+        toPersonEmail: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
+        toPersonId: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
         parentId: {type: 'string'},
-        text: {type: 'string'},
-        markdown: {type: 'string'},
-        html: {type: 'string'},
+        text: {type: 'string', description: 'Content: provide at least one of text, markdown, html, filePaths, fileUrls, or attachments'},
+        markdown: {type: 'string', description: 'Content: provide at least one of text, markdown, html, filePaths, fileUrls, or attachments'},
+        html: {type: 'string', description: 'Content: provide at least one of text, markdown, html, filePaths, fileUrls, or attachments'},
         filePaths: {type: 'array', items: {type: 'string'}},
         fileUrls: {type: 'array', items: {type: 'string'}},
         attachments: {type: 'array', items: {type: 'object'}},
@@ -3355,16 +3657,11 @@ const TOOLS = [
     description: 'Build and send a richly formatted engineering update as markdown, html, or an adaptive card.',
     inputSchema: {
       type: 'object',
-      anyOf: [
-        {required: ['roomId']},
-        {required: ['toPersonEmail']},
-        {required: ['toPersonId']},
-      ],
       properties: {
         actor: {type: 'string', enum: ['auto', 'user', 'bot']},
-        roomId: {type: 'string'},
-        toPersonEmail: {type: 'string'},
-        toPersonId: {type: 'string'},
+        roomId: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
+        toPersonEmail: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
+        toPersonId: {type: 'string', description: 'Destination: provide roomId, toPersonEmail, or toPersonId'},
         parentId: {type: 'string'},
         mode: {type: 'string', enum: ['markdown', 'html', 'card']},
         severity: {type: 'string', enum: ['default', 'accent', 'good', 'warning', 'attention']},
@@ -3539,7 +3836,7 @@ const TOOLS = [
       },
     },
   },
-];
+]);
 
 async function callTool(config, name, args = {}) {
   switch (name) {
@@ -3643,6 +3940,54 @@ async function callTool(config, name, args = {}) {
         recordings: filtered.map(summarizeRecording),
       });
     }
+    case 'list_call_detail_records': {
+      enforceCallDetailWindow(args, MAX_CDR_FEED_WINDOW_MS, 'CDR feed');
+      const context = await getUserScopedContext(config, args.actor || 'auto');
+      const records = await context.api.listCallDetailRecords({
+        startTime: args.startTime,
+        endTime: args.endTime,
+        locations: args.locations,
+        baseUrl: args.baseUrl,
+        max: args.max || 100,
+      });
+      const filtered = records.filter((record) => callDetailMatchesFilter(record, args));
+      return jsonText({
+        actor: context.actor,
+        source: 'cdr_feed',
+        startTime: args.startTime,
+        endTime: args.endTime,
+        count: filtered.length,
+        rawCount: records.length,
+        summary: summarizeCallDetailRecords(filtered),
+        records: filtered.map((record) =>
+          summarizeCallDetailRecord(record, {includeRaw: Boolean(args.includeRaw)})
+        ),
+      });
+    }
+    case 'list_live_call_detail_records': {
+      enforceCallDetailWindow(args, MAX_CDR_STREAM_WINDOW_MS, 'CDR stream');
+      const context = await getUserScopedContext(config, args.actor || 'auto');
+      const records = await context.api.listLiveCallDetailRecords({
+        startTime: args.startTime,
+        endTime: args.endTime,
+        locations: args.locations,
+        baseUrl: args.baseUrl,
+        max: args.max || 100,
+      });
+      const filtered = records.filter((record) => callDetailMatchesFilter(record, args));
+      return jsonText({
+        actor: context.actor,
+        source: 'cdr_stream',
+        startTime: args.startTime,
+        endTime: args.endTime,
+        count: filtered.length,
+        rawCount: records.length,
+        summary: summarizeCallDetailRecords(filtered),
+        records: filtered.map((record) =>
+          summarizeCallDetailRecord(record, {includeRaw: Boolean(args.includeRaw)})
+        ),
+      });
+    }
     case 'list_meetings': {
       const context = await getUserScopedContext(config, args.actor || 'auto');
       const meetings = await context.api.listMeetings({
@@ -3654,6 +3999,26 @@ async function callTool(config, name, args = {}) {
         actor: context.actor,
         count: meetings.length,
         meetings: meetings.map(summarizeMeeting),
+      });
+    }
+    case 'list_meeting_participants': {
+      const context = await getUserScopedContext(config, args.actor || 'auto');
+      const participants = await context.api.listMeetingParticipants({
+        meetingId: args.meetingId,
+        max: args.max || 100,
+      });
+      const summarized = participants.map(summarizeMeetingParticipant);
+      const totalDurationSeconds = summarized.reduce(
+        (total, participant) => total + (participant.durationSeconds || 0),
+        0
+      );
+      return jsonText({
+        actor: context.actor,
+        meetingId: args.meetingId,
+        count: summarized.length,
+        totalParticipantDurationSeconds: totalDurationSeconds,
+        totalParticipantDurationMinutes: Math.round((totalDurationSeconds / 60) * 10) / 10,
+        participants: summarized,
       });
     }
     case 'create_meeting': {
@@ -4410,7 +4775,11 @@ async function main() {
 
 }
 
-main().catch((error) => {
-  console.error(error.stack || error.message || String(error));
-  process.exit(1);
-});
+export {TOOLS, validatePublishedToolSchemas};
+
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error.stack || error.message || String(error));
+    process.exit(1);
+  });
+}
