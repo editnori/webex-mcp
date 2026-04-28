@@ -616,6 +616,12 @@ function createWebexApi(token, {baseDir, resolveLocalPath, cdrBaseUrl} = {}) {
     listMeetingParticipants(options = {}) {
       return listCollection('/meetingParticipants', options, Number(options.max || 100));
     },
+    listActiveCalls() {
+      return request('/telephony/calls');
+    },
+    listUserCallHistory(options = {}) {
+      return listCollection('/telephony/calls/history', options, Number(options.max || 100));
+    },
     getRecording(recordingId) {
       return request(`/recordings/${encodeURIComponent(recordingId)}`);
     },
@@ -2071,6 +2077,73 @@ function summarizeMeetingParticipant(participant) {
   };
 }
 
+function summarizeActiveCall(call) {
+  return {
+    id: call.id || call.callId || null,
+    status: call.status || call.state || '',
+    type: call.type || '',
+    direction: call.direction || '',
+    callerId: call.callerId || call.callingParty || null,
+    calledId: call.calledId || call.calledParty || null,
+    remoteParty: call.remoteParty || call.person || null,
+    created: call.created || call.startTime || call.time || null,
+    raw: call,
+  };
+}
+
+function summarizeUserCallHistoryItem(item) {
+  return {
+    type: item.type || '',
+    name: item.name || '',
+    number: item.number || '',
+    privacyEnabled: Boolean(item.privacyEnabled),
+    time: item.time || item.created || null,
+    durationSeconds: Number(item.durationSeconds || item.duration || 0) || null,
+  };
+}
+
+function filterUserCallHistory(items, args = {}) {
+  const fromMs = args.from ? parseIsoTime(args.from, 'from') : null;
+  const toMs = args.to ? parseIsoTime(args.to, 'to') : null;
+  const type = `${args.type || ''}`.trim().toLowerCase();
+  const query = `${args.query || ''}`.trim().toLowerCase();
+
+  return items.filter((item) => {
+    const summary = summarizeUserCallHistoryItem(item);
+    const itemMs = summary.time ? Date.parse(summary.time) : NaN;
+
+    if (fromMs !== null && (!Number.isFinite(itemMs) || itemMs < fromMs)) return false;
+    if (toMs !== null && (!Number.isFinite(itemMs) || itemMs > toMs)) return false;
+    if (type && summary.type.toLowerCase() !== type) return false;
+    if (query) {
+      const haystack = `${summary.name} ${summary.number} ${summary.type}`.toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+
+    return true;
+  });
+}
+
+function summarizeUserCallHistory(items) {
+  const byType = {};
+  let oldest = null;
+  let newest = null;
+
+  for (const item of items.map(summarizeUserCallHistoryItem)) {
+    const type = item.type || 'unknown';
+    byType[type] = (byType[type] || 0) + 1;
+    if (item.time && (!oldest || Date.parse(item.time) < Date.parse(oldest))) oldest = item.time;
+    if (item.time && (!newest || Date.parse(item.time) > Date.parse(newest))) newest = item.time;
+  }
+
+  return {
+    count: items.length,
+    byType,
+    oldest,
+    newest,
+  };
+}
+
 function summarizeMeetingSitesResponse(value) {
   const sites = Array.isArray(value?.sites) ? value.sites : [];
   return {
@@ -3116,6 +3189,33 @@ const TOOLS = validatePublishedToolSchemas([
     },
   },
   {
+    name: 'list_active_calls',
+    description:
+      'List active Webex Calling calls currently associated with the OAuth user. Requires spark:calls_read or spark:xsi and only returns active call-control state, not historical duration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        actor: {type: 'string', enum: ['auto', 'user']},
+      },
+    },
+  },
+  {
+    name: 'list_user_call_history',
+    description:
+      'List the OAuth user Webex Calling call history from /telephony/calls/history. Requires user-level calling scopes such as spark:calls_read or spark:xsi. This is not CDR and may omit duration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        actor: {type: 'string', enum: ['auto', 'user']},
+        max: {type: 'integer', minimum: 1, maximum: 500},
+        from: {type: 'string', description: 'Optional local ISO timestamp lower bound.'},
+        to: {type: 'string', description: 'Optional local ISO timestamp upper bound.'},
+        type: {type: 'string', description: 'Optional local filter such as missed, received, or placed.'},
+        query: {type: 'string', description: 'Optional local name/number/type substring filter.'},
+      },
+    },
+  },
+  {
     name: 'list_live_call_detail_records',
     description:
       'List near-real-time Webex Calling Detailed Call History records from analytics-calling /cdr_stream. Requires spark-admin:calling_cdr_read and the Control Hub Detailed Call History API access role. Each request is limited to a 2-hour window.',
@@ -3962,6 +4062,37 @@ async function callTool(config, name, args = {}) {
         records: filtered.map((record) =>
           summarizeCallDetailRecord(record, {includeRaw: Boolean(args.includeRaw)})
         ),
+      });
+    }
+    case 'list_active_calls': {
+      const context = await getUserScopedContext(config, args.actor || 'auto');
+      const response = await context.api.listActiveCalls();
+      const calls = Array.isArray(response?.items)
+        ? response.items
+        : Array.isArray(response?.calls)
+          ? response.calls
+          : Array.isArray(response)
+            ? response
+            : [];
+      return jsonText({
+        actor: context.actor,
+        count: calls.length,
+        calls: calls.map(summarizeActiveCall),
+        raw: response,
+      });
+    }
+    case 'list_user_call_history': {
+      const context = await getUserScopedContext(config, args.actor || 'auto');
+      const history = await context.api.listUserCallHistory({
+        max: args.max || 100,
+      });
+      const filtered = filterUserCallHistory(history, args);
+      return jsonText({
+        actor: context.actor,
+        count: filtered.length,
+        rawCount: history.length,
+        summary: summarizeUserCallHistory(filtered),
+        calls: filtered.map(summarizeUserCallHistoryItem),
       });
     }
     case 'list_live_call_detail_records': {

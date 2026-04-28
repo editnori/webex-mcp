@@ -189,6 +189,18 @@ Notes:
 
 ### Webex Calling CDR
 
+These tools use user-level Webex Calling APIs:
+
+- `list_active_calls`
+- `list_user_call_history`
+
+Notes:
+
+- they are user-only, not bot-only
+- they require user-level calling scopes such as `spark:calls_read`, `spark:xsi`, and sometimes `spark:webrtc_calling`
+- `list_active_calls` calls `/telephony/calls` and only returns currently active call-control state
+- `list_user_call_history` calls `/telephony/calls/history`; it can count recent missed/received/placed calls, but it is not CDR and may omit duration
+
 These tools use the Webex Calling Detailed Call History APIs:
 
 - `list_call_detail_records`
